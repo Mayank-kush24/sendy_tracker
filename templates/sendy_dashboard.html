@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en" data-template-mtime="{{ _template_mtime }}">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sendy Analytics</title>
+  <script src="{{ url_for('static', filename='js/chart.umd.min.js') }}"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --primary:     #6366f1;
+      --primary-dk:  #4f46e5;
+      --primary-bg:  #eef2ff;
+      --success:     #10b981;
+      --danger:      #ef4444;
+      --warning:     #f59e0b;
+      --cyan:        #06b6d4;
+      --purple:      #a855f7;
+      --orange:      #f97316;
+      --bg:          #f8fafc;
+      --surface:     #ffffff;
+      --border:      #e2e8f0;
+      --text:        #1e293b;
+      --text-mid:    #64748b;
+      --text-light:  #94a3b8;
+      --radius:      10px;
+      --shadow:      0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
+      --shadow-md:   0 4px 6px rgba(0,0,0,.07), 0 2px 4px rgba(0,0,0,.05);
+    }
+
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           font-size: 14px; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+    /* ── Header ── */
+    .header { background: #1e293b; color: #f8fafc; padding: 0 24px; height: 56px;
+              display: flex; align-items: center; justify-content: space-between;
+              position: sticky; top: 0; z-index: 200; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+    .header-left { display: flex; align-items: center; gap: 10px; }
+    .header h1   { font-size: 17px; font-weight: 600; letter-spacing: -.3px; }
+    .header-pill { background: #334155; font-size: 11px; color: #94a3b8;
+                   padding: 2px 9px; border-radius: 20px; }
+    .header-right { display: flex; align-items: center; gap: 14px; }
+    #last-updated { font-size: 12px; color: #64748b; }
+
+    /* ── Layout ── */
+    .main { max-width: 1400px; margin: 0 auto; padding: 22px 24px 60px; }
+    .gap  { margin-bottom: 20px; }
+
+    /* ── Filters ── */
+    .filters { background: var(--surface); border: 1px solid var(--border);
+               border-radius: var(--radius); padding: 14px 18px;
+               display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px;
+               box-shadow: var(--shadow); }
+    .fg { display: flex; flex-direction: column; gap: 4px; }
+    .fg label { font-size: 11px; font-weight: 600; color: var(--text-mid);
+                text-transform: uppercase; letter-spacing: .5px; }
+    .fg input, .fg select { height: 34px; padding: 0 10px;
+                border: 1px solid var(--border); border-radius: 6px;
+                font-size: 13px; color: var(--text); background: var(--bg);
+                outline: none; transition: border-color .15s, background .15s; }
+    .fg input:focus, .fg select:focus { border-color: var(--primary); background: #fff; }
+    .fg input[type="date"] { min-width: 142px; }
+    .fg select { min-width: 110px; cursor: pointer; }
+    .btn-group { display: flex; gap: 8px; align-items: flex-end; margin-left: auto; }
+    .btn { height: 34px; padding: 0 16px; border: none; border-radius: 6px;
+           font-size: 13px; font-weight: 500; cursor: pointer;
+           transition: background .15s, opacity .15s; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-dk); }
+    .btn-ghost { background: var(--bg); border: 1px solid var(--border); color: var(--text-mid); }
+    .btn-ghost:hover { border-color: #94a3b8; color: var(--text); }
+
+    /* ── Stat cards ── */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+             gap: 14px; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 16px 18px 14px;
+            box-shadow: var(--shadow); position: relative; overflow: hidden; }
+    .card::after { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+    .card:nth-child(1)::after { background: var(--primary); }
+    .card:nth-child(2)::after { background: var(--success); }
+    .card:nth-child(3)::after { background: var(--cyan); }
+    .card:nth-child(4)::after { background: var(--danger); }
+    .card:nth-child(5)::after { background: var(--orange); }
+    .card:nth-child(6)::after { background: var(--warning); }
+    .card:nth-child(7)::after { background: var(--purple); }
+    .card:nth-child(8)::after { background: #ec4899; }
+
+    .card-icon  { font-size: 18px; margin-bottom: 8px; line-height: 1; }
+    .card-label { font-size: 11px; font-weight: 600; color: var(--text-mid);
+                  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+    .card-value { font-size: 26px; font-weight: 700; letter-spacing: -.5px;
+                  color: var(--text); line-height: 1; }
+    .card-sub   { margin-top: 4px; font-size: 11px; color: var(--text-light); }
+
+    /* ── Charts ── */
+    .charts { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+    @media (max-width: 960px) { .charts { grid-template-columns: 1fr; } }
+
+    .chart-card { background: var(--surface); border: 1px solid var(--border);
+                  border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
+    .chart-card h2 { font-size: 14px; font-weight: 600; margin-bottom: 14px;
+                     display: flex; align-items: center; gap: 6px; }
+    .chart-wrap { position: relative; height: 280px; }
+    .chart-wrap canvas { position: absolute; inset: 0; }
+
+    .empty-state { position: absolute; inset: 0; display: flex; flex-direction: column;
+                   align-items: center; justify-content: center;
+                   gap: 8px; color: var(--text-light); text-align: center; }
+    .empty-icon { font-size: 32px; opacity: .55; }
+    .empty-state p { font-size: 13px; max-width: 200px; line-height: 1.5; }
+
+    /* ── Subscriber section ── */
+    .sub-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .sub-grid { grid-template-columns: 1fr; } }
+
+    /* ── Table section ── */
+    .table-section { background: var(--surface); border: 1px solid var(--border);
+                     border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+    .table-header { display: flex; align-items: center; justify-content: space-between;
+                    padding: 14px 20px; border-bottom: 1px solid var(--border);
+                    flex-wrap: wrap; gap: 10px; }
+    .table-header h2 { font-size: 14px; font-weight: 600;
+                       display: flex; align-items: center; gap: 6px; }
+    .table-controls { display: flex; align-items: center; gap: 10px; }
+    .search-box { height: 32px; padding: 0 10px 0 30px; border: 1px solid var(--border);
+                  border-radius: 6px; font-size: 13px; outline: none; width: 220px;
+                  background: var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='13' height='13' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2.5'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E") no-repeat 9px center;
+                  transition: border-color .15s; }
+    .search-box:focus { border-color: var(--primary); background-color: #fff; }
+    .row-count  { font-size: 12px; color: var(--text-mid); white-space: nowrap; }
+    .export-btn { height: 32px; padding: 0 12px; border: 1px solid var(--border);
+                  border-radius: 6px; font-size: 12px; font-weight: 500;
+                  cursor: pointer; background: var(--bg); color: var(--text-mid);
+                  transition: border-color .15s; }
+    .export-btn:hover { border-color: #94a3b8; color: var(--text); }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600;
+               color: var(--text-mid); text-transform: uppercase; letter-spacing: .4px;
+               background: #f8fafc; border-bottom: 1px solid var(--border);
+               white-space: nowrap; user-select: none; }
+    thead th.sortable { cursor: pointer; }
+    thead th.sortable:hover { color: var(--primary); }
+    thead th.sorted { color: var(--primary); }
+    .sort-icon { opacity: .35; margin-left: 3px; font-size: 11px; }
+    thead th.sorted .sort-icon { opacity: 1; }
+    tbody tr { border-bottom: 1px solid #f1f5f9; transition: background .1s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #f8fafc; }
+    tbody td { padding: 10px 14px; font-size: 13px; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+    .badge-good { display: inline-block; background: #d1fae5; color: #065f46;
+                  border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: 600; }
+    .badge-warn { display: inline-block; background: #fef3c7; color: #92400e;
+                  border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: 600; }
+    .badge-bad  { display: inline-block; background: #fee2e2; color: #991b1b;
+                  border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: 600; }
+
+    /* ── Lists mini-table ── */
+    .lists-table td, .lists-table th { padding: 8px 12px; }
+
+    /* ── Pagination ── */
+    .pagination { display: flex; justify-content: center; align-items: center;
+                  gap: 4px; padding: 12px; border-top: 1px solid var(--border); }
+    .pagination button { height: 30px; min-width: 30px; padding: 0 8px;
+                         border: 1px solid var(--border); border-radius: 5px;
+                         background: var(--surface); font-size: 13px;
+                         cursor: pointer; color: var(--text-mid); transition: all .12s; }
+    .pagination button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+    .pagination button.active { background: var(--primary); border-color: var(--primary);
+                                color: #fff; font-weight: 600; }
+    .pagination button:disabled { opacity: .4; cursor: not-allowed; }
+    .pg-ellipsis { color: var(--text-light); font-size: 14px; padding: 0 3px; }
+
+    /* ── Spinner ── */
+    .spinner-overlay { position: fixed; inset: 0; background: rgba(255,255,255,.65);
+                       backdrop-filter: blur(2px); display: flex; align-items: center;
+                       justify-content: center; z-index: 999; }
+    .spinner { width: 42px; height: 42px; border: 3px solid var(--border);
+               border-top-color: var(--primary); border-radius: 50%;
+               animation: spin .65s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Toast ── */
+    .toast { position: fixed; top: 68px; right: 20px; background: #fef2f2;
+             border: 1px solid #fecaca; color: #991b1b;
+             padding: 12px 18px; border-radius: 8px; font-size: 13px;
+             max-width: 400px; z-index: 500; box-shadow: var(--shadow-md);
+             animation: slideIn .2s ease; }
+    @keyframes slideIn { from { transform: translateX(16px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    .section-title { font-size: 14px; font-weight: 600; color: var(--text);
+                     margin-bottom: 14px; display: flex; align-items: center; gap: 6px; }
+    .hidden { display: none !important; }
+    .divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+  </style>
+</head>
+<body>
+
+<div class="spinner-overlay hidden" id="spinner"><div class="spinner"></div></div>
+<div class="toast hidden" id="toast"></div>
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<header class="header">
+  <div class="header-left">
+    <h1>📧 Sendy Analytics</h1>
+    <span class="header-pill">Central Dashboard</span>
+  </div>
+  <div class="header-right">
+    <span id="last-updated">Never refreshed</span>
+    <button class="btn btn-ghost" style="height:30px;font-size:12px" onclick="loadAll()">↻ Refresh</button>
+  </div>
+</header>
+
+<main class="main">
+
+  <!-- ── Filters ────────────────────────────────────────────────────────── -->
+  <div class="filters gap">
+    <div class="fg">
+      <label>From</label>
+      <input type="date" id="date-from" />
+    </div>
+    <div class="fg">
+      <label>To</label>
+      <input type="date" id="date-to" />
+    </div>
+    <div class="fg">
+      <label>Group By</label>
+      <select id="group-by">
+        <option value="month">Month</option>
+        <option value="day">Day</option>
+      </select>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="loadAll()">Apply Filters</button>
+      <button class="btn btn-ghost"   onclick="resetFilters()">Reset</button>
+    </div>
+  </div>
+
+  <!-- ── Overview cards ─────────────────────────────────────────────────── -->
+  <div class="cards gap">
+    <div class="card">
+      <div class="card-icon">📤</div>
+      <div class="card-label">Emails Sent</div>
+      <div class="card-value" id="c-sent">—</div>
+      <div class="card-sub" id="c-campaigns">— campaigns</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">👁</div>
+      <div class="card-label">Total Opens</div>
+      <div class="card-value" id="c-opens">—</div>
+      <div class="card-sub" id="c-open-rate">— open rate</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🖱</div>
+      <div class="card-label">Unique Clicks</div>
+      <div class="card-value" id="c-clicks">—</div>
+      <div class="card-sub" id="c-click-rate">— click rate</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🔴</div>
+      <div class="card-label">Bounces</div>
+      <div class="card-value" id="c-bounces">—</div>
+      <div class="card-sub" id="c-bounce-rate">— bounce rate</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">🚫</div>
+      <div class="card-label">Unsubscribes</div>
+      <div class="card-value" id="c-unsubs">—</div>
+      <div class="card-sub">in selected range</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">👥</div>
+      <div class="card-label">Total Subscribers</div>
+      <div class="card-value" id="c-subs-total">—</div>
+      <div class="card-sub" id="c-subs-active">— active</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">✅</div>
+      <div class="card-label">Confirmed</div>
+      <div class="card-value" id="c-subs-confirmed">—</div>
+      <div class="card-sub">double opt-in</div>
+    </div>
+    <div class="card">
+      <div class="card-icon">⚠️</div>
+      <div class="card-label">Complaints</div>
+      <div class="card-value" id="c-complaints">—</div>
+      <div class="card-sub">spam reports</div>
+    </div>
+  </div>
+
+  <!-- ── Time-series charts ─────────────────────────────────────────────── -->
+  <div class="charts gap">
+
+    <div class="chart-card">
+      <h2>📈 Email Activity Over Time</h2>
+      <div class="chart-wrap">
+        <canvas id="line-chart"></canvas>
+        <div class="empty-state hidden" id="line-empty">
+          <div class="empty-icon">📭</div>
+          <p>No campaign data for the selected range.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <h2>📊 Avg Rates</h2>
+      <div class="chart-wrap">
+        <canvas id="donut-chart"></canvas>
+        <div class="empty-state hidden" id="donut-empty">
+          <div class="empty-icon">📭</div>
+          <p>No data available.</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Campaign bar chart ─────────────────────────────────────────────── -->
+  <div class="chart-card gap">
+    <h2>📬 Campaign Open &amp; Click Rates (latest 15)</h2>
+    <div class="chart-wrap" style="height:240px">
+      <canvas id="bar-chart"></canvas>
+      <div class="empty-state hidden" id="bar-empty">
+        <div class="empty-icon">📭</div>
+        <p>No campaigns in the selected range.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Campaign performance table ─────────────────────────────────────── -->
+  <div class="table-section gap">
+    <div class="table-header">
+      <h2>📋 Campaign Performance</h2>
+      <div class="table-controls">
+        <input class="search-box" type="search" id="camp-search" placeholder="Search title or subject…" />
+        <span class="row-count" id="camp-count">0 rows</span>
+        <button class="export-btn" onclick="exportCampaignCSV()">⬇ CSV</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div class="empty-state" id="camp-empty" style="padding:44px 0">
+        <div class="empty-icon">📭</div>
+        <p>No sent campaigns for the selected filters.</p>
+      </div>
+      <table id="camp-table" class="hidden">
+        <thead>
+          <tr>
+            <th class="sortable" data-col="title">Title <span class="sort-icon">↕</span></th>
+            <th class="sortable" data-col="send_date">Send Date <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="sent">Sent <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="opens">Opens <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="clicks">Clicks <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="bounces">Bounces <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="unsubscribes">Unsubs <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="open_rate_pct">Open % <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="click_rate_pct">Click % <span class="sort-icon">↕</span></th>
+            <th class="sortable num" data-col="bounce_rate_pct">Bounce % <span class="sort-icon">↕</span></th>
+          </tr>
+        </thead>
+        <tbody id="camp-tbody"></tbody>
+      </table>
+    </div>
+    <div class="pagination" id="camp-pagination"></div>
+  </div>
+
+  <!-- ── Subscriber section ─────────────────────────────────────────────── -->
+  <hr class="divider" />
+  <div class="section-title">👥 Subscriber Health</div>
+
+  <div class="sub-grid gap">
+
+    <div class="chart-card">
+      <h2>📈 Subscriber Growth</h2>
+      <div class="chart-wrap" style="height:240px">
+        <canvas id="growth-chart"></canvas>
+        <div class="empty-state hidden" id="growth-empty">
+          <div class="empty-icon">📭</div>
+          <p>No subscriber data for the selected range.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-card" style="overflow:auto">
+      <h2>📋 Lists Summary</h2>
+      <table class="lists-table" style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr>
+            <th style="text-align:left;padding:8px 12px;font-size:11px;font-weight:600;color:var(--text-mid);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)">List</th>
+            <th style="text-align:right;padding:8px 12px;font-size:11px;font-weight:600;color:var(--text-mid);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)">Total</th>
+            <th style="text-align:right;padding:8px 12px;font-size:11px;font-weight:600;color:var(--text-mid);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)">Active</th>
+            <th style="text-align:right;padding:8px 12px;font-size:11px;font-weight:600;color:var(--text-mid);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)">Unsubs</th>
+            <th style="text-align:right;padding:8px 12px;font-size:11px;font-weight:600;color:var(--text-mid);text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--border)">Bounce%</th>
+          </tr>
+        </thead>
+        <tbody id="lists-tbody">
+          <tr><td colspan="5" style="text-align:center;padding:28px;color:var(--text-light);font-size:13px">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+</main>
+
+<script>
+'use strict';
+
+// ── Constants ─────────────────────────────────────────────────────────────
+const PAGE_SIZE = 25;
+
+// ── State ─────────────────────────────────────────────────────────────────
+const S = {
+  campaigns: [],
+  timeSeries: [],
+  subGrowth: [],
+  sort: { col: 'send_date', dir: 'desc' },
+  page: 1,
+  search: '',
+};
+
+// ── Chart instances ────────────────────────────────────────────────────────
+let lineChart = null, donutChart = null, barChart = null, growthChart = null;
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  setDefaultDates();
+  bindEvents();
+  loadAll();
+});
+
+function bindEvents() {
+  $('camp-search').addEventListener('input', e => {
+    S.search = e.target.value.toLowerCase().trim();
+    S.page   = 1;
+    renderTable();
+  });
+  document.querySelectorAll('th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.col;
+      S.sort = { col, dir: S.sort.col === col && S.sort.dir === 'asc' ? 'desc' : 'asc' };
+      S.page = 1;
+      renderTable();
+    });
+  });
+}
+
+// ── Dates ─────────────────────────────────────────────────────────────────
+function setDefaultDates() {
+  const today = new Date();
+  const from  = new Date(today);
+  from.setFullYear(from.getFullYear() - 1);
+  $('date-to').value   = fmtDate(today);
+  $('date-from').value = fmtDate(from);
+}
+
+function fmtDate(d) { return d.toISOString().split('T')[0]; }
+
+function resetFilters() {
+  $('group-by').value = 'month';
+  setDefaultDates();
+  loadAll();
+}
+
+// ── Load ──────────────────────────────────────────────────────────────────
+async function loadAll() {
+  showSpinner();
+  clearToast();
+
+  // Reset opens card to "loading" while we wait for the slow async call
+  setText('c-opens',     '…');
+  setText('c-open-rate', 'computing…');
+
+  try {
+    const [statsRes, campRes, subRes] = await Promise.all([
+      apiFetch('/api/sendy/stats',       statsParams()),
+      apiFetch('/api/sendy/campaigns',   { ...dateParams(), limit: 500 }),
+      apiFetch('/api/sendy/subscribers', { ...dateParams(), group_by: val('group-by') }),
+    ]);
+
+    S.timeSeries = statsRes.time_series ?? [];
+    S.campaigns  = campRes.data         ?? [];
+    S.subGrowth  = subRes.growth        ?? [];
+
+    renderCards(statsRes.overview ?? {}, statsRes.subscribers ?? {});
+    renderLineChart(S.timeSeries);
+    renderDonutChart(statsRes.overview ?? {});
+    renderBarChart(S.campaigns.slice(0, 15));
+    renderGrowthChart(S.subGrowth);
+    renderListsTable(subRes.lists ?? []);
+
+    S.page = 1;
+    S.search = '';
+    $('camp-search').value = '';
+    renderTable();
+
+    $('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    showToast(err.message);
+  } finally {
+    hideSpinner();
+  }
+
+  // Load open rate asynchronously (slow: ~17–35 s, cached 1 h on server)
+  loadOpenRate();
+}
+
+async function loadOpenRate() {
+  try {
+    const res = await apiFetch('/api/sendy/stats', { ...dateParams(), type: 'open_rate' });
+    const d   = res.data ?? {};
+    const fmt = n => (n ?? 0).toLocaleString();
+    const pct = n => n != null ? `${n}%` : '—';
+    setText('c-opens',     fmt(d.total_opens));
+    setText('c-open-rate', `${pct(d.avg_open_rate_pct)} avg open rate`);
+    // update donut chart with real open rate
+    if (d.avg_open_rate_pct) {
+      const ov = { avg_open_rate_pct: d.avg_open_rate_pct };
+      // patch existing overview object and re-render donut
+      const currentOv = {
+        avg_open_rate_pct:  d.avg_open_rate_pct,
+        avg_click_rate_pct: S._lastOv?.avg_click_rate_pct  ?? 0,
+        avg_bounce_rate_pct: S._lastOv?.avg_bounce_rate_pct ?? 0,
+      };
+      renderDonutChart(currentOv);
+    }
+  } catch (_) {
+    setText('c-opens',     '—');
+    setText('c-open-rate', 'unavailable');
+  }
+}
+
+async function apiFetch(path, params = {}) {
+  const url = new URL(path, window.location.origin);
+  Object.entries(params).forEach(([k, v]) => { if (v !== '' && v != null) url.searchParams.set(k, v); });
+  const res  = await fetch(url);
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
+  return json;
+}
+
+function statsParams() { return { ...dateParams(), group_by: val('group-by') }; }
+function dateParams()  { return { date_from: val('date-from'), date_to: val('date-to') }; }
+function val(id)       { return ($(`${id}`)?.value ?? '').trim(); }
+
+// ── Cards ─────────────────────────────────────────────────────────────────
+function renderCards(ov, sub) {
+  const fmt  = n => (n ?? 0).toLocaleString();
+  const pct  = n => (n != null && n !== '') ? `${n}%` : '—';
+
+  S._lastOv = ov;  // save for async open-rate update
+
+  setText('c-sent',           fmt(ov.total_sent));
+  setText('c-campaigns',      `${fmt(ov.total_campaigns)} campaigns`);
+  // c-opens and c-open-rate are set after async loadOpenRate() completes
+  setText('c-clicks',         fmt(ov.total_clicks));
+  setText('c-click-rate',     `${pct(ov.avg_click_rate_pct)} avg click rate`);
+  setText('c-bounces',        fmt(ov.total_bounces));
+  setText('c-bounce-rate',    `${pct(ov.avg_bounce_rate_pct)} bounce rate`);
+  setText('c-unsubs',         fmt(ov.total_unsubscribes));
+  setText('c-subs-total',     fmt(ov.total_subscribers ?? sub.total));
+  setText('c-subs-active',    `${fmt(sub.active)} active`);
+  setText('c-subs-confirmed', fmt(sub.confirmed));
+  setText('c-complaints',     fmt(sub.complaints));
+}
+
+// ── Line chart (time series) ───────────────────────────────────────────────
+function renderLineChart(data) {
+  const canvas = $('line-chart'), empty = $('line-empty');
+  lineChart?.destroy(); lineChart = null;
+  if (!data.length) { canvas.classList.add('hidden'); empty.classList.remove('hidden'); return; }
+  canvas.classList.remove('hidden'); empty.classList.add('hidden');
+
+  const sparse = data.length > 60;
+  lineChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.period),
+      datasets: [
+        ls('Emails Sent',   data.map(d => d.emails_sent ?? 0), '#6366f1', true,  sparse),
+        ls('Clicks',        data.map(d => d.clicks      ?? 0), '#06b6d4', false, sparse),
+      ],
+    },
+    options: lineOpts(),
+  });
+}
+
+function ls(label, data, color, fill, sparse, dash = []) {
+  return { label, data, borderColor: color,
+    backgroundColor: fill ? rgba(color, .10) : 'transparent',
+    fill, tension: 0.4, borderWidth: 2, borderDash: dash,
+    pointRadius: sparse ? 0 : 3, pointHoverRadius: 5 };
+}
+
+// ── Donut chart (avg rates) ────────────────────────────────────────────────
+function renderDonutChart(ov) {
+  const canvas = $('donut-chart'), empty = $('donut-empty');
+  donutChart?.destroy(); donutChart = null;
+
+  const open  = ov.avg_open_rate_pct   ?? 0;
+  const click = ov.avg_click_rate_pct  ?? 0;
+  const bounce = ov.avg_bounce_rate_pct ?? 0;
+  const rest  = Math.max(0, 100 - open - click - bounce);
+
+  if (!open && !click && !bounce) {
+    canvas.classList.add('hidden'); empty.classList.remove('hidden'); return;
+  }
+  canvas.classList.remove('hidden'); empty.classList.add('hidden');
+
+  donutChart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: ['Open Rate', 'Click Rate', 'Bounce Rate', 'Other'],
+      datasets: [{
+        data: [open, click, bounce, rest],
+        backgroundColor: ['#10b981','#6366f1','#ef4444','#e2e8f0'],
+        borderWidth: 2, borderColor: '#fff',
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 10 } },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${ctx.label}: ${ctx.raw}%`,
+          },
+        },
+      },
+    },
+  });
+}
+
+// ── Bar chart (top campaigns) ──────────────────────────────────────────────
+function renderBarChart(data) {
+  const canvas = $('bar-chart'), empty = $('bar-empty');
+  barChart?.destroy(); barChart = null;
+  if (!data.length) { canvas.classList.add('hidden'); empty.classList.remove('hidden'); return; }
+  canvas.classList.remove('hidden'); empty.classList.add('hidden');
+
+  const labels = data.map(d => {
+    const parts = [d.campaign_display, d.title, d.subject];
+    let s = '';
+    for (const x of parts) {
+      if (x != null && String(x).trim() !== '') {
+        s = String(x).trim();
+        break;
+      }
+    }
+    if (!s && d.campaign_id != null) s = '#' + d.campaign_id;
+    return trunc(s, 20);
+  });
+  barChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Open %',   data: data.map(d => d.open_rate_pct   ?? 0), backgroundColor: rgba('#10b981',.8), borderRadius: 3 },
+        { label: 'Click %',  data: data.map(d => d.click_rate_pct  ?? 0), backgroundColor: rgba('#6366f1',.8), borderRadius: 3 },
+        { label: 'Bounce %', data: data.map(d => d.bounce_rate_pct ?? 0), backgroundColor: rgba('#ef4444',.8), borderRadius: 3 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 10 } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.raw}%` } },
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 30 } },
+        y: { beginAtZero: true, ticks: { callback: v => v + '%', font: { size: 11 } },
+             grid: { color: 'rgba(0,0,0,.05)' } },
+      },
+    },
+  });
+}
+
+// ── Growth chart ───────────────────────────────────────────────────────────
+function renderGrowthChart(data) {
+  const canvas = $('growth-chart'), empty = $('growth-empty');
+  growthChart?.destroy(); growthChart = null;
+  if (!data.length) { canvas.classList.add('hidden'); empty.classList.remove('hidden'); return; }
+  canvas.classList.remove('hidden'); empty.classList.add('hidden');
+
+  const sparse = data.length > 60;
+  growthChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: data.map(d => d.period),
+      datasets: [
+        ls('New Subscribers', data.map(d => d.new_subscribers ?? 0), '#6366f1', true,  sparse),
+        ls('Still Active',    data.map(d => d.still_active    ?? 0), '#10b981', false, sparse),
+        ls('Unsubscribed',    data.map(d => d.unsubscribed    ?? 0), '#f97316', false, sparse, [4,3]),
+        ls('Bounced',         data.map(d => d.bounced         ?? 0), '#ef4444', false, sparse, [4,3]),
+      ],
+    },
+    options: { ...lineOpts(), scales: { x: xScale(), y: yScale('Subscribers') } },
+  });
+}
+
+// ── Lists table ───────────────────────────────────────────────────────────
+function renderListsTable(lists) {
+  const tbody = $('lists-tbody');
+  if (!lists.length) {
+    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:28px;color:var(--text-light);font-size:13px">No list data.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = lists.map(l => `
+    <tr style="border-bottom:1px solid #f1f5f9">
+      <td style="padding:8px 12px;font-size:13px">${esc(l.list_name ?? '—')}</td>
+      <td class="num" style="padding:8px 12px;font-size:13px;text-align:right">${fmt(l.total)}</td>
+      <td class="num" style="padding:8px 12px;font-size:13px;text-align:right;color:#10b981;font-weight:600">${fmt(l.active)}</td>
+      <td class="num" style="padding:8px 12px;font-size:13px;text-align:right">${fmt(l.unsubscribed)}</td>
+      <td class="num" style="padding:8px 12px;font-size:13px;text-align:right">${rateBadge(l.bounce_rate_pct)}</td>
+    </tr>
+  `).join('');
+}
+
+// ── Campaign table ─────────────────────────────────────────────────────────
+function renderTable() {
+  const filtered = applySearch(S.campaigns);
+  const sorted   = applySort(filtered);
+  const pageRows = applyPage(sorted);
+
+  const empty = $('camp-empty'), table = $('camp-table'), tbody = $('camp-tbody');
+  setText('camp-count', `${filtered.length.toLocaleString()} campaigns`);
+
+  if (!filtered.length) {
+    table.classList.add('hidden'); empty.classList.remove('hidden');
+    $('camp-pagination').innerHTML = ''; return;
+  }
+  empty.classList.add('hidden'); table.classList.remove('hidden');
+
+  tbody.innerHTML = pageRows.map(r => `
+    <tr>
+      <td title="${esc(r.subject ?? '')}">${esc(trunc((r.campaign_display || r.title || r.subject || '—'), 40))}</td>
+      <td>${esc(r.send_date ?? '—')}</td>
+      <td class="num">${fmt(r.sent)}</td>
+      <td class="num">${fmt(r.opens)}</td>
+      <td class="num">${fmt(r.clicks)}</td>
+      <td class="num">${fmt(r.bounces)}</td>
+      <td class="num">${fmt(r.unsubscribes)}</td>
+      <td class="num">${rateBadge(r.open_rate_pct,   20, 10)}</td>
+      <td class="num">${rateBadge(r.click_rate_pct,  5,  2)}</td>
+      <td class="num">${bounceBadge(r.bounce_rate_pct)}</td>
+    </tr>
+  `).join('');
+
+  updateSortIcons();
+  renderPagination(filtered.length);
+}
+
+function applySearch(rows) {
+  if (!S.search) return rows;
+  return rows.filter(r =>
+    (r.title   ?? '').toLowerCase().includes(S.search) ||
+    (r.subject ?? '').toLowerCase().includes(S.search)
+  );
+}
+
+function applySort(rows) {
+  const { col, dir } = S.sort;
+  return [...rows].sort((a, b) => {
+    const av = a[col] ?? '', bv = b[col] ?? '';
+    if (av < bv) return dir === 'asc' ? -1 :  1;
+    if (av > bv) return dir === 'asc' ?  1 : -1;
+    return 0;
+  });
+}
+
+function applyPage(rows) {
+  return rows.slice((S.page - 1) * PAGE_SIZE, S.page * PAGE_SIZE);
+}
+
+function updateSortIcons() {
+  document.querySelectorAll('th.sortable').forEach(th => {
+    const icon = th.querySelector('.sort-icon');
+    const active = th.dataset.col === S.sort.col;
+    icon.textContent = active ? (S.sort.dir === 'asc' ? '↑' : '↓') : '↕';
+    th.classList.toggle('sorted', active);
+  });
+}
+
+// ── Pagination ────────────────────────────────────────────────────────────
+function renderPagination(total) {
+  const pages = Math.ceil(total / PAGE_SIZE), el = $('camp-pagination');
+  if (pages <= 1) { el.innerHTML = ''; return; }
+  const cur = S.page;
+  let html = pgBtn('‹', cur - 1, cur === 1);
+  for (let i = 1; i <= pages; i++) {
+    if (i === 1 || i === pages || Math.abs(i - cur) <= 1) html += pgBtn(i, i, false, i === cur);
+    else if (Math.abs(i - cur) === 2) html += '<span class="pg-ellipsis">…</span>';
+  }
+  html += pgBtn('›', cur + 1, cur === pages);
+  el.innerHTML = html;
+  el.querySelectorAll('button[data-page]').forEach(b =>
+    b.addEventListener('click', () => { S.page = +b.dataset.page; renderTable(); })
+  );
+}
+
+function pgBtn(label, page, disabled, active = false) {
+  return `<button data-page="${page}"${disabled?' disabled':''}${active?' class="active"':''}>${label}</button>`;
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────
+function exportCampaignCSV() {
+  const rows = applySort(applySearch(S.campaigns));
+  if (!rows.length) { showToast('No data to export.'); return; }
+  const cols = ['title','subject','send_date','sent','opens','clicks','bounces','unsubscribes','open_rate_pct','click_rate_pct','bounce_rate_pct'];
+  const lines = [cols.join(','), ...rows.map(r => cols.map(c => `"${String(r[c]??'').replace(/"/g,'""')}"`).join(','))];
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' })),
+    download: `sendy_campaigns_${fmtDate(new Date())}.csv`,
+  });
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+// ── Shared chart helpers ──────────────────────────────────────────────────
+function lineOpts() {
+  return {
+    responsive: true, maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 }, padding: 10 } },
+      tooltip: { bodyFont: { size: 12 }, titleFont: { size: 12 } },
+    },
+    scales: { x: xScale(), y: yScale('Count') },
+  };
+}
+function xScale() {
+  return { grid: { display: false }, ticks: { font: { size: 11 }, maxTicksLimit: 14, maxRotation: 0 } };
+}
+function yScale(t) {
+  return { title: { display: true, text: t, font: { size: 11 }, color: '#94a3b8' },
+           beginAtZero: true, grid: { color: 'rgba(0,0,0,.05)' }, ticks: { font: { size: 11 } } };
+}
+
+// ── Badges ────────────────────────────────────────────────────────────────
+function rateBadge(val, good = 15, warn = 5) {
+  if (val == null) return '—';
+  const cls = val >= good ? 'badge-good' : val >= warn ? 'badge-warn' : 'badge-bad';
+  return `<span class="${cls}">${val}%</span>`;
+}
+function bounceBadge(val) {
+  if (val == null) return '—';
+  const cls = val <= 2 ? 'badge-good' : val <= 5 ? 'badge-warn' : 'badge-bad';
+  return `<span class="${cls}">${val}%</span>`;
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────────
+function $(id) { return document.getElementById(id); }
+function setText(id, v) { const e = $(id); if (e) e.textContent = v; }
+function fmt(n) { return n != null ? (+n).toLocaleString() : '—'; }
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function trunc(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
+function rgba(hex, a) {
+  const [r,g,b] = [hex.slice(1,3),hex.slice(3,5),hex.slice(5,7)].map(h => parseInt(h,16));
+  return `rgba(${r},${g},${b},${a})`;
+}
+function showSpinner() { $('spinner').classList.remove('hidden'); }
+function hideSpinner() { $('spinner').classList.add('hidden'); }
+
+let _toastT = null;
+function showToast(msg) {
+  const el = $('toast'); el.textContent = '⚠ ' + msg; el.classList.remove('hidden');
+  clearTimeout(_toastT); _toastT = setTimeout(clearToast, 7000);
+}
+function clearToast() { $('toast').classList.add('hidden'); }
+</script>
+</body>
+</html>

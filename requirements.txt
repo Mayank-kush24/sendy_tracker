@@ -1,0 +1,13 @@
+flask>=3.0
+sqlalchemy>=2.0
+pymysql>=1.1
+pandas>=2.0
+python-dotenv>=1.0
+cryptography>=42.0   # pymysql optional dep for caching_sha2_password auth
+
+# Caching (optional — install redis when using REDIS_URL)
+redis>=5.0
+
+# Production WSGI server (optional, swap gunicorn for waitress on Windows)
+gunicorn>=22.0; sys_platform != "win32"
+waitress>=3.0; sys_platform == "win32"

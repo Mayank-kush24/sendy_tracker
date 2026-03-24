@@ -1,0 +1,15 @@
+# Optional local Redis for sendy_tracker caching.
+# Start:  docker compose -f docker-compose.redis.yml up -d
+# Then set in .env:  REDIS_URL=redis://127.0.0.1:6379/0
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - sendy_tracker_redis:/data
+
+volumes:
+  sendy_tracker_redis:
