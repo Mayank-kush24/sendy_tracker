@@ -9,22 +9,24 @@ links.clicks     = 'sub_id,sub_id,...'                  (comma-separated)
 
 Count formula: LENGTH(col) - LENGTH(REPLACE(col, ',', '')) + 1
 (one comma = two entries, so +1 gives the correct element count)
+
+When ``USE_DENORM_COUNTS`` is True, aggregates use ``campaigns.opens_count`` and
+``links.clicks_count`` (see ``migrations/004_denorm_opens_clicks_counts.sql``).
 """
 
 import logging
 import os
 import re
+from datetime import date, datetime, timedelta
 
 import pandas as pd
+from flask import g
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from cache import cached
 from db import fetch_data
 
 logger = logging.getLogger(__name__)
-
-# How many recent campaigns to pull ``opens`` longtext for (large = slow remote DB)
-ENGAGEMENT_PARSE_CAMPAIGNS = max(5, min(100, int(os.getenv("ENGAGEMENT_PARSE_CAMPAIGNS", "25"))))
 
 # Max rows returned by ``get_campaign_performance`` (dashboard campaign name list / stats)
 CAMPAIGN_PERF_MAX = max(200, min(10_000, int(os.getenv("CAMPAIGN_PERF_MAX", "5000"))))
@@ -33,11 +35,28 @@ CAMPAIGN_PERF_DEFAULT = max(50, min(CAMPAIGN_PERF_MAX, int(os.getenv("CAMPAIGN_P
 CAMPAIGN_ENGAGEMENT_SUMMARY_MAX = max(
     30, min(1000, int(os.getenv("CAMPAIGN_ENGAGEMENT_SUMMARY_MAX", "180")))
 )
-# Stream subscriber rows (no ``GROUP BY``) when building distinct-email pages.
-USERS_EMAIL_FETCH_BATCH = max(500, min(20_000, int(os.getenv("USERS_EMAIL_FETCH_BATCH", "2500"))))
-USERS_EMAIL_MAX_ROWS_SCAN = max(
-    50_000, min(5_000_000, int(os.getenv("USERS_EMAIL_MAX_ROWS_SCAN", "400000")))
+
+# OPTIMIZED: capped env var chunk sizes to prevent runaway query loads
+CAMPAIGN_PERF_DETAIL_CHUNK = min(int(os.getenv("CAMPAIGN_PERF_DETAIL_CHUNK", "50")), 100)
+USERS_EMAIL_FETCH_BATCH = min(int(os.getenv("USERS_EMAIL_FETCH_BATCH", "500")), 2000)
+USERS_EMAIL_IN_CHUNK = min(int(os.getenv("USERS_EMAIL_IN_CHUNK", "200")), 500)
+USERS_EMAIL_MAX_ROWS_SCAN = min(int(os.getenv("USERS_EMAIL_MAX_ROWS_SCAN", "50000")), 200000)
+ENGAGEMENT_PARSE_CAMPAIGNS = min(int(os.getenv("ENGAGEMENT_PARSE_CAMPAIGNS", "200")), 500)
+# ``get_engagement_map``: fetch ``lists`` in batches (remote MySQL — avoid one multi‑MB result set).
+ENGAGEMENT_LISTS_FETCH_BATCH = min(
+    max(int(os.getenv("ENGAGEMENT_LISTS_FETCH_BATCH", "300")), 50),
+    2000,
 )
+
+# Subscriber growth chart: split wide ``date_from``/``date_to`` into smaller queries
+# so remote MySQL does not hit max_execution_time / drop the socket (2013).
+# 0 = single query (old behaviour).
+SUBSCRIBER_STATS_CHUNK_DAYS = max(
+    0, min(366, int(os.getenv("SUBSCRIBER_STATS_CHUNK_DAYS", "45")))
+)
+
+# Use ``opens_count`` / ``clicks_count`` instead of LENGTH/REPLACE on longtext at query time.
+USE_DENORM_COUNTS = True  # set False to revert
 
 _SENT_FILTER = "sent IS NOT NULL AND sent NOT IN ('', '0')"
 
@@ -93,22 +112,14 @@ def _parse_campaign_list_ids(raw: object) -> frozenset[int]:
 
 def campaign_effective_unix_ts_sql(table_alias: str) -> str:
     """
-    SQL expression: best-effort Unix timestamp for when a campaign was sent.
+    SQL expression: Unix timestamp for when a campaign was sent.
 
-    ``sent`` may be a Unix string, ``'1'``, or empty; ``send_date`` may hold
-    the real time (see Sendy ``campaigns`` table).
+    Backed by the ``campaigns.effective_ts`` STORED GENERATED column
+    (see ``migrations/001_campaigns_effective_ts.sql``) so ``WHERE``,
+    ``ORDER BY``, and range scans can use ``idx_camp_effective_ts``.
     """
     p = f"{table_alias}." if table_alias else ""
-    return (
-        f"COALESCE("
-        f"IF(CAST({p}sent AS UNSIGNED) BETWEEN 1000000000 AND 2100000000,"
-        f" CAST({p}sent AS UNSIGNED), NULL),"
-        f"IF({p}send_date REGEXP '^[0-9]{{9,11}}$', CAST({p}send_date AS UNSIGNED), NULL),"
-        f"IF(CHAR_LENGTH(TRIM(COALESCE({p}send_date,''))) >= 10"
-        f" AND SUBSTRING(TRIM({p}send_date), 5, 1) = '-',"
-        f" UNIX_TIMESTAMP(STR_TO_DATE(SUBSTRING(TRIM({p}send_date), 1, 10), '%Y-%m-%d')), NULL)"
-        f")"
-    )
+    return f"{p}effective_ts"
 
 
 def build_campaign_where_sent_in_range(
@@ -154,16 +165,49 @@ def get_subscriber_list_ids(sub_ids: list[int]) -> dict[int, int]:
     return {int(r["id"]): int(r["list_id"]) for _, r in df.iterrows()}
 
 
-def _comma_count(col: str) -> str:
+def _comma_count_expr(col: str) -> str:
     """
-    SQL expression: count comma-separated entries in *col*.
+    SQL expression: count comma-separated entries in *col* (longtext scan).
     Returns 0 for NULL / empty string.
-    Works for both campaigns.opens ('id:CC,...') and links.clicks ('id,...').
     """
     return (
         f"CASE WHEN {col} IS NULL OR {col} = '' THEN 0 "
         f"ELSE LENGTH({col}) - LENGTH(REPLACE({col}, ',', '')) + 1 END"
     )
+
+
+def _comma_count_col(table_alias: str, col_type: str) -> str:
+    """
+    Comma-delimited entry count for ``opens`` or ``clicks`` on *table_alias*.
+
+    *col_type* — ``'opens'`` (``campaigns``) or ``'clicks'`` (``links``).
+    When ``USE_DENORM_COUNTS`` is True, returns the stored counter column name.
+    """
+    p = f"{table_alias}."
+    if USE_DENORM_COUNTS:
+        if col_type == "opens":
+            return f"{p}opens_count"
+        if col_type == "clicks":
+            return f"{p}clicks_count"
+        raise ValueError(f"unknown col_type: {col_type!r}")
+    if col_type == "opens":
+        return _comma_count_expr(f"{p}opens")
+    if col_type == "clicks":
+        return _comma_count_expr(f"{p}clicks")
+    raise ValueError(f"unknown col_type: {col_type!r}")
+
+
+def _comma_count(col: str) -> str:
+    """
+    Count comma-separated entries for ``c.opens`` / ``lk.clicks``, or any *col*
+    via ``_comma_count_expr`` when denormalized columns do not apply.
+    """
+    if USE_DENORM_COUNTS:
+        if col == "c.opens":
+            return "c.opens_count"
+        if col == "lk.clicks":
+            return "lk.clicks_count"
+    return _comma_count_expr(col)
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +333,7 @@ def _subscriber_where_fragment(
         params["confirmed"] = 1 if str(status) in ("1", "confirmed", "active") else 0
     pat = _email_search_pattern(email_search)
     if pat is not None:
-        conditions.append(f"LOWER({p}email) LIKE :email_like")
+        conditions.append(f"{p}email_lower LIKE :email_like")
         params["email_like"] = pat
     if require_nonblank_email:
         conditions.append(f"TRIM(COALESCE({p}email, '')) != ''")
@@ -317,7 +361,7 @@ def count_users(
     return int(df.iloc[0]["total"]) if len(df) else 0
 
 
-@cached(ttl=300)
+@cached(ttl=600)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def count_users_distinct_email(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -325,13 +369,13 @@ def count_users_distinct_email(
     status: str | None = None,
     email_search: str | None = None,
 ) -> int:
-    """Distinct non-blank emails (``LOWER(TRIM(email))``) — same filters as ``count_users``."""
+    """Distinct non-blank emails (via ``email_lower``) — same filters as ``count_users``."""
     frag, params = _subscriber_where_fragment(
         "", date_from, date_to, list_id, status, email_search,
         require_nonblank_email=True,
     )
     sql = f"""
-        SELECT COUNT(DISTINCT LOWER(TRIM(email))) AS n
+        SELECT COUNT(DISTINCT email_lower) AS n
         FROM   subscribers
         WHERE  {frag}
     """
@@ -436,6 +480,10 @@ def get_users_by_email(
     need = offset + limit + 1
     seen_order: list[str] = []
     seen_set: set[str] = set()
+    # First row’s stored ``s.email`` per normalized key — second phase uses
+    # ``s.email IN (...)`` so MySQL can use ``s_email``; fallback uses
+    # ``s.email_lower IN (...)`` (indexed) when canonical addresses are missing.
+    key_to_canonical: dict[str, str] = {}
 
     batch = USERS_EMAIL_FETCH_BATCH
     max_scan = USERS_EMAIL_MAX_ROWS_SCAN
@@ -475,6 +523,9 @@ def get_users_by_email(
                 continue
             if ek not in seen_set:
                 seen_set.add(ek)
+                raw_em = str(row.get("email") or "").strip()
+                if raw_em:
+                    key_to_canonical[ek] = raw_em
                 seen_order.append(ek)
                 if len(seen_order) >= need:
                     break
@@ -500,32 +551,81 @@ def get_users_by_email(
         "s", date_from, date_to, list_id, status, email_search,
         require_nonblank_email=True,
     )
-    in_params = dict(p_in)
-    placeholders = ", ".join(f":_ek{i}" for i in range(len(page_keys)))
-    for i, k in enumerate(page_keys):
-        in_params[f"_ek{i}"] = k
 
-    where_full = f"{frag2} AND LOWER(TRIM(s.email)) IN ({placeholders})"
-    sql_full = f"""
-        SELECT
-            s.id,
-            s.email,
-            s.name,
-            s.`list`                                AS list_id,
-            li.name                                 AS list_name,
-            s.confirmed,
-            s.unsubscribed,
-            s.bounced,
-            DATE(FROM_UNIXTIME(s.timestamp))       AS joined_date,
-            LOWER(TRIM(s.email))                    AS email_key
-        FROM   subscribers s
-        LEFT   JOIN lists li ON li.id = s.`list`
-        WHERE  {where_full}
-        ORDER  BY s.timestamp DESC
-    """
-    df_full = fetch_data(sql_full, in_params)
-    if df_full is None or df_full.empty:
+    chunk_sz = USERS_EMAIL_IN_CHUNK
+    parts: list[pd.DataFrame] = []
+
+    def _fetch_user_chunk_by_emails(emails: list[str]) -> pd.DataFrame | None:
+        if not emails:
+            return None
+        ip = dict(p_in)
+        ph = ", ".join(f":_em{i}" for i in range(len(emails)))
+        for i, em in enumerate(emails):
+            ip[f"_em{i}"] = em
+        wf = f"{frag2} AND s.email IN ({ph})"
+        q = f"""
+            SELECT
+                s.id,
+                s.email,
+                s.name,
+                s.`list`                                AS list_id,
+                li.name                                 AS list_name,
+                s.confirmed,
+                s.unsubscribed,
+                s.bounced,
+                DATE(FROM_UNIXTIME(s.timestamp))       AS joined_date,
+                LOWER(TRIM(s.email))                    AS email_key
+            FROM   subscribers s
+            LEFT   JOIN lists li ON li.id = s.`list`
+            WHERE  {wf}
+        """
+        return fetch_data(q, ip)
+
+    def _fetch_user_chunk_by_keys(keys: list[str]) -> pd.DataFrame | None:
+        """Fallback when no canonical address was stored (rare)."""
+        if not keys:
+            return None
+        ip = dict(p_in)
+        ph = ", ".join(f":_ek{i}" for i in range(len(keys)))
+        for i, k in enumerate(keys):
+            ip[f"_ek{i}"] = k
+        wf = f"{frag2} AND s.email_lower IN ({ph})"
+        q = f"""
+            SELECT
+                s.id,
+                s.email,
+                s.name,
+                s.`list`                                AS list_id,
+                li.name                                 AS list_name,
+                s.confirmed,
+                s.unsubscribed,
+                s.bounced,
+                DATE(FROM_UNIXTIME(s.timestamp))       AS joined_date,
+                LOWER(TRIM(s.email))                    AS email_key
+            FROM   subscribers s
+            LEFT   JOIN lists li ON li.id = s.`list`
+            WHERE  {wf}
+        """
+        return fetch_data(q, ip)
+
+    for start in range(0, len(page_keys), chunk_sz):
+        chunk_keys = page_keys[start : start + chunk_sz]
+        canon = [key_to_canonical.get(k, "").strip() for k in chunk_keys]
+        with_canon = [e for e in canon if e]
+        missing_keys = [k for k, e in zip(chunk_keys, canon) if not e]
+
+        if with_canon:
+            df_part = _fetch_user_chunk_by_emails(with_canon)
+            if df_part is not None and len(df_part) > 0:
+                parts.append(df_part)
+        if missing_keys:
+            df_fb = _fetch_user_chunk_by_keys(missing_keys)
+            if df_fb is not None and len(df_fb) > 0:
+                parts.append(df_fb)
+
+    if not parts:
         return empty, False
+    df_full = pd.concat(parts, ignore_index=True)
 
     df_full = df_full.copy()
     df_full["email_key"] = df_full["email_key"].astype(str)
@@ -563,6 +663,82 @@ def get_users_by_email(
 # Stats – subscriber growth
 # ---------------------------------------------------------------------------
 
+def _fetch_subscriber_stats_once(
+    date_from: str | None,
+    date_to: str | None,
+    list_id: int | None,
+    group_by: str,
+    fmt: str,
+) -> pd.DataFrame:
+    """One DB round-trip for subscriber growth (used alone or per chunk)."""
+    conditions, params = [], {}
+    if date_from:
+        conditions.append("timestamp >= UNIX_TIMESTAMP(:date_from)")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("timestamp < UNIX_TIMESTAMP(DATE_ADD(:date_to, INTERVAL 1 DAY))")
+        params["date_to"] = date_to
+    if list_id is not None:
+        conditions.append("`list` = :list_id")
+        params["list_id"] = list_id
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    if list_id is not None:
+        group_sql = "GROUP BY period, `list`"
+        select_extra = ",\n            `list`  AS list_id"
+    else:
+        group_sql = "GROUP BY period"
+        select_extra = ""
+
+    sql = f"""
+        SELECT
+            DATE_FORMAT(FROM_UNIXTIME(`timestamp`), '{fmt}') AS period
+            {select_extra},
+            COUNT(*)                                        AS new_subscribers,
+            SUM(bounced)                                    AS bounced,
+            SUM(unsubscribed)                               AS unsubscribed,
+            COUNT(*) - SUM(bounced) - SUM(unsubscribed)     AS net_active
+        FROM   subscribers
+        {where}
+        {group_sql}
+        ORDER  BY period DESC
+    """
+    return fetch_data(sql, params)
+
+
+def _merge_subscriber_stat_chunks(dfs: list[pd.DataFrame], has_list: bool) -> pd.DataFrame:
+    """Sum metrics for duplicate period (and list) keys after chunked queries."""
+    parts = [d for d in dfs if d is not None and len(d) > 0]
+    if not parts:
+        return pd.DataFrame()
+    df = pd.concat(parts, ignore_index=True)
+    agg = {
+        "new_subscribers": "sum",
+        "bounced": "sum",
+        "unsubscribed": "sum",
+    }
+    if has_list:
+        out = df.groupby(["period", "list_id"], as_index=False).agg(agg)
+    else:
+        out = df.groupby("period", as_index=False).agg(agg)
+    out["net_active"] = (
+        out["new_subscribers"] - out["bounced"] - out["unsubscribed"]
+    )
+    return out.sort_values("period", ascending=False).reset_index(drop=True)
+
+
+def _subscriber_stats_date_chunks(d0: date, d1: date, chunk_days: int) -> list[tuple[str, str]]:
+    """Inclusive calendar ranges as YYYY-MM-DD strings."""
+    out: list[tuple[str, str]] = []
+    cur = d0
+    while cur <= d1:
+        c_end = min(cur + timedelta(days=chunk_days - 1), d1)
+        out.append((cur.isoformat(), c_end.isoformat()))
+        cur = c_end + timedelta(days=1)
+    return out
+
+
 @cached(ttl=300)
 def get_subscriber_stats(
     date_from: str | None = None,
@@ -578,6 +754,10 @@ def get_subscriber_stats(
     15+ seconds.  Pass *list_id* to get per-list breakdown for a single list.
 
     subscribers.timestamp is a Unix int — filters use UNIX_TIMESTAMP().
+
+    Wide ``date_from``/``date_to`` ranges are split into chunks of
+    ``SUBSCRIBER_STATS_CHUNK_DAYS`` (default 45, ``0`` = one query) so large
+    ``GROUP BY`` scans do not trigger MySQL socket drops (2013).
     """
     fmt = _PERIOD_FORMATS.get(group_by)
     if fmt is None:
@@ -585,42 +765,40 @@ def get_subscriber_stats(
             f"'group_by' must be one of {list(_PERIOD_FORMATS)}, got {group_by!r}"
         )
 
-    conditions, params = [], {}
-    if date_from:
-        conditions.append("timestamp >= UNIX_TIMESTAMP(:date_from)")
-        params["date_from"] = date_from
-    if date_to:
-        conditions.append("timestamp < UNIX_TIMESTAMP(DATE_ADD(:date_to, INTERVAL 1 DAY))")
-        params["date_to"] = date_to
-    if list_id is not None:
-        conditions.append("`list` = :list_id")
-        params["list_id"] = list_id
+    chunk = SUBSCRIBER_STATS_CHUNK_DAYS
+    use_chunks = (
+        chunk > 0
+        and date_from
+        and date_to
+        and str(date_from).strip()
+        and str(date_to).strip()
+    )
+    if use_chunks:
+        try:
+            d0 = datetime.strptime(str(date_from).strip()[:10], "%Y-%m-%d").date()
+            d1 = datetime.strptime(str(date_to).strip()[:10], "%Y-%m-%d").date()
+        except ValueError:
+            use_chunks = False
+        else:
+            span = (d1 - d0).days + 1
+            if span <= chunk:
+                use_chunks = False
 
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    if not use_chunks:
+        return _fetch_subscriber_stats_once(date_from, date_to, list_id, group_by, fmt)
 
-    # Only group by list when filtering to a specific list; otherwise aggregate
-    # across all lists to keep the result set small and query fast.
-    if list_id is not None:
-        group_sql  = "GROUP BY period, `list`"
-        select_extra = ",\n            `list`  AS list_id"
-    else:
-        group_sql  = "GROUP BY period"
-        select_extra = ""
-
-    sql = f"""
-        SELECT
-            DATE_FORMAT(FROM_UNIXTIME(timestamp), '{fmt}') AS period
-            {select_extra},
-            COUNT(*)                                        AS new_subscribers,
-            SUM(bounced)                                    AS bounced,
-            SUM(unsubscribed)                               AS unsubscribed,
-            COUNT(*) - SUM(bounced) - SUM(unsubscribed)     AS net_active
-        FROM   subscribers
-        {where}
-        {group_sql}
-        ORDER  BY period DESC
-    """
-    return fetch_data(sql, params)
+    ranges = _subscriber_stats_date_chunks(d0, d1, chunk)
+    logger.info(
+        "subscriber stats: %d chunk(s) of up to %d day(s) for %s → %s",
+        len(ranges),
+        chunk,
+        date_from,
+        date_to,
+    )
+    dfs: list[pd.DataFrame] = []
+    for cf, ct in ranges:
+        dfs.append(_fetch_subscriber_stats_once(cf, ct, list_id, group_by, fmt))
+    return _merge_subscriber_stat_chunks(dfs, list_id is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -654,14 +832,15 @@ def get_campaign_by_id(campaign_id: int) -> pd.DataFrame:
     return fetch_data(sql, {"campaign_id": campaign_id})
 
 
-@cached(ttl=120)
+@cached(ttl=300)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def get_campaign_stats() -> pd.DataFrame:
-    """Aggregated open / click stats per sent campaign (cached 2 min).
+    """Aggregated open / click stats per sent campaign (cached 5 min).
 
     Uses a pre-aggregated JOIN on links (10 K rows) — no correlated subqueries.
+    Uses ``_comma_count`` on native Sendy ``opens`` / ``clicks`` longtext (no shadow columns).
     """
-    opens_expr  = _comma_count("c.opens")
-    clicks_expr = _comma_count("lk.clicks")   # alias matches FROM links lk
+    opens_expr = _comma_count("c.opens")
+    clicks_expr = _comma_count("lk.clicks")
     sql = f"""
         SELECT
             c.id                                                AS campaign_id,
@@ -713,7 +892,7 @@ def get_email_totals(
     return fetch_data(sql, params)
 
 
-@cached(ttl=300)
+@cached(ttl=600)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def get_engagement_map(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -742,10 +921,29 @@ def get_engagement_map(
     uses_lists_column = True
     emails_sent_by_list: dict[int, int] = {}
     try:
-        df_lc = fetch_data(f"SELECT lists FROM campaigns {where}", params)
-        for _, row in df_lc.iterrows():
-            for lid in _parse_campaign_list_ids(row.get("lists")):
-                emails_sent_by_list[lid] = emails_sent_by_list.get(lid, 0) + 1
+        # OPTIMIZED: batched ``lists`` fetch for large date ranges (remote DB + narrow result sets).
+        _lb = ENGAGEMENT_LISTS_FETCH_BATCH
+        _cursor: int | None = None
+        while True:
+            if _cursor is None:
+                _extra, _p = "", dict(params)
+            else:
+                _extra = " AND id < :_eng_lists_cursor "
+                _p = dict(params)
+                _p["_eng_lists_cursor"] = _cursor
+            _sql_lc = (
+                f"SELECT id, lists FROM campaigns {where}{_extra} "
+                f"ORDER BY id DESC LIMIT {_lb}"
+            )
+            df_lc = fetch_data(_sql_lc, _p)
+            if df_lc is None or len(df_lc) == 0:
+                break
+            for _, row in df_lc.iterrows():
+                for lid in _parse_campaign_list_ids(row.get("lists")):
+                    emails_sent_by_list[lid] = emails_sent_by_list.get(lid, 0) + 1
+            _cursor = int(df_lc["id"].min())
+            if len(df_lc) < _lb:
+                break
     except OperationalError as exc:
         orig = str(getattr(exc, "orig", exc))
         if "lists" in orig.lower() and "unknown column" in orig.lower():
@@ -854,6 +1052,23 @@ def get_engagement_map(
     }
 
 
+def get_engagement_map_cached(*args, **kwargs) -> dict:
+    # OPTIMIZED: request-scoped cache to prevent duplicate engagement map queries
+    cache_key = repr((args, tuple(sorted(kwargs.items()))))
+    try:
+        store = getattr(g, "_engagement_map_request_cache", None)
+        if store is None:
+            store = {}
+            g._engagement_map_request_cache = store
+        if cache_key in store:
+            return store[cache_key]
+        out = get_engagement_map(*args, **kwargs)
+        store[cache_key] = out
+        return out
+    except RuntimeError:
+        return get_engagement_map(*args, **kwargs)
+
+
 def get_queue_delivered_counts(
     sub_ids: list[int],
     date_from: str | None,
@@ -867,28 +1082,34 @@ def get_queue_delivered_counts(
     """
     if not sub_ids:
         return {}
-    clause, params = build_campaign_where_sent_in_range("c", date_from, date_to, {})
-    placeholders = ", ".join(f":_q{i}" for i in range(len(sub_ids)))
-    for i, sid in enumerate(sub_ids):
-        params[f"_q{i}"] = int(sid)
-    sql = f"""
-        SELECT q.subscriber_id AS subscriber_id,
-               COUNT(DISTINCT q.campaign_id) AS n
-        FROM   queue q
-        INNER JOIN campaigns c ON c.id = q.campaign_id
-        WHERE  q.subscriber_id IN ({placeholders})
-          AND  q.sent >= 1
-          AND  {clause}
-        GROUP BY q.subscriber_id
-    """
+    clause, base_params = build_campaign_where_sent_in_range("c", date_from, date_to, {})
+    # OPTIMIZED: chunk subscriber IN-list (same cap as list-id lookups; remote MySQL packet limits).
+    _qc = USERS_EMAIL_IN_CHUNK if USERS_EMAIL_IN_CHUNK > 0 else 500
+    _qc = min(_qc, 500)
+    out: dict[int, int] = {}
     try:
-        df = fetch_data(sql, params)
+        for _off in range(0, len(sub_ids), _qc):
+            part = sub_ids[_off : _off + _qc]
+            params = dict(base_params)
+            placeholders = ", ".join(f":_q{i}" for i in range(len(part)))
+            for i, sid in enumerate(part):
+                params[f"_q{i}"] = int(sid)
+            sql = f"""
+                SELECT q.subscriber_id AS subscriber_id,
+                       COUNT(DISTINCT q.campaign_id) AS n
+                FROM   queue q
+                INNER JOIN campaigns c ON c.id = q.campaign_id
+                WHERE  q.subscriber_id IN ({placeholders})
+                  AND  q.sent >= 1
+                  AND  {clause}
+                GROUP BY q.subscriber_id
+            """
+            df = fetch_data(sql, params)
+            for _, row in df.iterrows():
+                out[int(row["subscriber_id"])] = int(row["n"] or 0)
     except (OperationalError, SQLAlchemyError) as exc:
         logger.info("queue-based engagement unavailable (%s) — using lists/recipients logic", exc)
         return None
-    out: dict[int, int] = {}
-    for _, row in df.iterrows():
-        out[int(row["subscriber_id"])] = int(row["n"] or 0)
     return out
 
 
@@ -913,8 +1134,13 @@ def build_engagement_for_subscribers(
             "checked_campaigns": 0,
         }
 
-    bundle = get_engagement_map(date_from=date_from, date_to=date_to)
-    id2list = get_subscriber_list_ids(sub_ids)
+    bundle = get_engagement_map_cached(date_from=date_from, date_to=date_to)
+    # OPTIMIZED: chunked IN-list to prevent oversized single query
+    id2list: dict[int, int] = {}
+    _list_id_chunk = USERS_EMAIL_IN_CHUNK if USERS_EMAIL_IN_CHUNK > 0 else 500
+    _list_id_chunk = min(_list_id_chunk, 500)
+    for _i in range(0, len(sub_ids), _list_id_chunk):
+        id2list.update(get_subscriber_list_ids(sub_ids[_i : _i + _list_id_chunk]))
     by_list = bundle["emails_sent_by_list"]
     camps = bundle["campaigns"]
     total_c = int(bundle["total_campaigns"])
@@ -1017,7 +1243,7 @@ def aggregate_engagement_by_email_rows(
     return out
 
 
-@cached(ttl=90)
+@cached(ttl=180)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def get_campaigns_sent_in_range_list(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -1044,6 +1270,8 @@ def get_campaigns_sent_in_range_list(
             c.title,
             c.label                                                         AS subject,
             {_CAMPAIGN_DISPLAY_SQL}                                         AS campaign_display,
+            c.send_date                                                     AS send_date,
+            c.sent                                                          AS campaign_sent,
             c.recipients                                                    AS emails_sent,
             0                                                               AS total_opens,
             0                                                               AS total_clicks,
@@ -1061,6 +1289,7 @@ def get_campaign_engagement_summary(
     date_from: str | None = None,
     date_to: str | None = None,
     status: str | None = None,
+    email_totals: pd.DataFrame | None = None,
 ) -> dict[str, float | int | None | bool]:
     """
     Recipient-weighted open / click % over campaigns in the date range.
@@ -1069,8 +1298,14 @@ def get_campaign_engagement_summary(
     we take a **middle** slice in send-time order (not always the newest 180),
     so nudging the date range usually changes which campaigns are included.
     The UI shows *N of M campaigns* when capped.
+
+    Pass *email_totals* from the caller when ``get_email_totals`` was already
+    executed for the same date range (avoids a duplicate query).
     """
-    totals = get_email_totals(date_from=date_from, date_to=date_to)
+    if email_totals is None:
+        totals = get_email_totals(date_from=date_from, date_to=date_to)
+    else:
+        totals = email_totals
     total_c = int(totals.iloc[0]["campaigns_sent"]) if len(totals) else 0
     if total_c <= 0:
         return {
@@ -1151,7 +1386,7 @@ def get_campaign_metrics_by_id(campaign_id: int) -> pd.DataFrame:
     """
     One-row Sendy-style metrics for a single campaign (dashboard expand-on-click).
 
-    Opens from ``campaigns.opens`` (comma-count); clicks summed from ``links``;
+    Opens/clicks from ``campaigns.opens`` / ``links.clicks`` via ``_comma_count``;
     bounces / unsubs / complaints / soft bounces from ``subscribers.last_campaign``.
     Not cached — reflects current DB when the user expands a row.
     """
@@ -1168,6 +1403,8 @@ def get_campaign_metrics_by_id(campaign_id: int) -> pd.DataFrame:
             c.title,
             c.label                                                         AS subject,
             {_CAMPAIGN_DISPLAY_SQL}                                         AS campaign_display,
+            c.send_date                                                     AS send_date,
+            c.sent                                                          AS campaign_sent,
             COALESCE(c.recipients, 0)                                       AS sent,
             COALESCE({opens_expr},  0)                                      AS opens,
             COALESCE(lnk_agg.total_clicks, 0)                                AS clicks,
@@ -1216,20 +1453,18 @@ def get_campaign_performance(
     Per-campaign engagement metrics (**not** application-cached — must track
     dashboard date-range changes immediately).
 
-    Uses a pre-aggregated JOIN on links — no correlated subqueries into the
-    11.9 M-row subscribers table.  Respects date_from/date_to via
-    ``build_campaign_where_sent_in_range``.
+    Uses **two round-trips**: (1) cheap ``campaigns``-only id list with
+    ``LIMIT``/``OFFSET``; (2) metrics for those ids via ``_comma_count`` on
+    ``opens`` / ``clicks`` longtext.
+    The old single-query shape duplicated the heavy date predicate on ``c2`` and
+    timed out remote MySQL on large ``OFFSET`` (engagement summary middle window).
 
-    *limit* caps how many campaigns are returned (newest first); defaults to
-    ``CAMPAIGN_PERF_DEFAULT``, hard-capped at ``CAMPAIGN_PERF_MAX``.
-    *offset_rows* skips that many rows after the same ORDER BY (for middle-window
-    sampling in the engagement summary card).
+    *limit* / *offset_rows* — same semantics as before (newest first by send time).
     """
-    opens_expr  = _comma_count("c.opens")
-    clicks_expr = _comma_count("lk.clicks")   # alias matches FROM links lk
+    opens_expr = _comma_count("c.opens")
+    clicks_expr = _comma_count("lk.clicks")
 
     clause_c, bind = build_campaign_where_sent_in_range("c", date_from, date_to, {})
-    clause_c2, bind = build_campaign_where_sent_in_range("c2", date_from, date_to, bind)
     try:
         lim = CAMPAIGN_PERF_DEFAULT if limit is None else int(limit)
     except (TypeError, ValueError):
@@ -1242,39 +1477,64 @@ def get_campaign_performance(
     bind["_limit"] = lim
     bind["_offset"] = off
     _ts = campaign_effective_unix_ts_sql("c")
-    _ts_c2 = campaign_effective_unix_ts_sql("c2")
 
-    # Aggregate ``links`` only for campaigns in this date window (up to ``lim``),
-    # not the whole links table — avoids full-table GROUP BY and MySQL disconnects
-    # on remote hosts when ``links`` has millions of rows.
-    sql = f"""
-        SELECT
-            c.id                                                            AS campaign_id,
-            c.title,
-            c.label                                                         AS subject,
-            {_CAMPAIGN_DISPLAY_SQL}                                         AS campaign_display,
-            c.recipients                                                    AS emails_sent,
-            COALESCE({opens_expr},  0)                                      AS total_opens,
-            COALESCE(lnk.total_clicks, 0)                                   AS total_clicks,
-            ROUND({opens_expr} * 100.0 / NULLIF(c.recipients, 0), 2)       AS open_rate_pct,
-            ROUND(COALESCE(lnk.total_clicks, 0) * 100.0
-                  / NULLIF(c.recipients, 0), 2)                             AS click_rate_pct
-        FROM campaigns c
-        LEFT JOIN (
-            SELECT lk.campaign_id,
-                   SUM({clicks_expr}) AS total_clicks
-            FROM   links lk
-            INNER JOIN (
-                SELECT c2.id
-                FROM   campaigns c2
-                WHERE  {clause_c2}
-                ORDER  BY COALESCE({_ts_c2}, 0) DESC, c2.id DESC
-                LIMIT  :_limit OFFSET :_offset
-            ) top_c ON top_c.id = lk.campaign_id
-            GROUP  BY lk.campaign_id
-        ) lnk ON lnk.campaign_id = c.id
+    id_sql = f"""
+        SELECT c.id AS campaign_id
+        FROM   campaigns c
         WHERE  {clause_c}
         ORDER  BY COALESCE({_ts}, 0) DESC, c.id DESC
         LIMIT  :_limit OFFSET :_offset
     """
-    return fetch_data(sql, bind)
+    df_ids = fetch_data(id_sql, bind)
+    _perf_cols = [
+        "campaign_id",
+        "title",
+        "subject",
+        "campaign_display",
+        "emails_sent",
+        "total_opens",
+        "total_clicks",
+        "open_rate_pct",
+        "click_rate_pct",
+    ]
+    if df_ids is None or len(df_ids) == 0:
+        return pd.DataFrame(columns=_perf_cols)
+
+    ids = [int(x) for x in df_ids["campaign_id"].tolist() if pd.notna(x)]
+    if not ids:
+        return pd.DataFrame(columns=_perf_cols)
+
+    cchunk = CAMPAIGN_PERF_DETAIL_CHUNK
+    detail_frames: list[pd.DataFrame] = []
+    for c0 in range(0, len(ids), cchunk):
+        sub = ids[c0 : c0 + cchunk]
+        id_csv = ",".join(str(i) for i in sub)
+        field_list = ",".join(str(i) for i in sub)
+        detail_sql = f"""
+            SELECT
+                c.id                                                            AS campaign_id,
+                c.title,
+                c.label                                                         AS subject,
+                {_CAMPAIGN_DISPLAY_SQL}                                         AS campaign_display,
+                c.recipients                                                    AS emails_sent,
+                COALESCE({opens_expr},  0)                                      AS total_opens,
+                COALESCE(lnk.total_clicks, 0)                                   AS total_clicks,
+                ROUND({opens_expr} * 100.0 / NULLIF(c.recipients, 0), 2)       AS open_rate_pct,
+                ROUND(COALESCE(lnk.total_clicks, 0) * 100.0
+                      / NULLIF(c.recipients, 0), 2)                             AS click_rate_pct
+            FROM campaigns c
+            LEFT JOIN (
+                SELECT lk.campaign_id,
+                       SUM({clicks_expr}) AS total_clicks
+                FROM   links lk
+                WHERE  lk.campaign_id IN ({id_csv})
+                GROUP  BY lk.campaign_id
+            ) lnk ON lnk.campaign_id = c.id
+            WHERE  c.id IN ({id_csv})
+            ORDER  BY FIELD(c.id, {field_list})
+        """
+        detail_frames.append(fetch_data(detail_sql, {}))
+
+    if not detail_frames:
+        return pd.DataFrame(columns=_perf_cols)
+    return pd.concat(detail_frames, ignore_index=True)

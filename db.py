@@ -12,7 +12,7 @@ from urllib.parse import quote_plus
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
@@ -107,6 +107,16 @@ def get_engine():
             pool_pre_ping=True,        # silently drops stale remote connections
             connect_args=connect_args,
         )
+
+        @event.listens_for(engine, "connect")
+        def set_mysql_session_opts(dbapi_conn, _):
+            cursor = dbapi_conn.cursor()
+            try:
+                cursor.execute("SET SESSION max_execution_time = 25000")
+                cursor.execute("SET SESSION net_read_timeout = 60")
+                cursor.execute("SET SESSION net_write_timeout = 60")
+            finally:
+                cursor.close()
 
         # Verify connectivity eagerly so errors surface here, not later.
         with engine.connect() as conn:

@@ -1,0 +1,260 @@
+================================================================================
+SENDY TRACKER — SQL QUERY INVENTORY (optimization reference)
+================================================================================
+Last aligned with queries.py + sendy_queries.py (batched engagement lists, chunked
+queue IN-lists, _comma_count on native opens/clicks, updated @cached TTLs).
+
+Runtime queries use db.fetch_data() → pandas read_sql unless noted.
+
+Legend
+------
+[HOT]   Likely heavy on large DBs (full scans, longtext, large IN lists, etc.)
+[VAR]   Round-trip count or SQL shape varies with parameters / data
+[CACHE] Result cached (@cached + optional Redis — see ttl in source)
+
+================================================================================
+0. CONFIG KNOBS (queries.py module constants, env-overridable)
+================================================================================
+Chunk sizes use min/max caps (see .env.example):
+
+  CAMPAIGN_PERF_DETAIL_CHUNK    default 50,  cap 100
+  USERS_EMAIL_FETCH_BATCH       default 500, cap 2000
+  USERS_EMAIL_IN_CHUNK          default 200, cap 500
+  USERS_EMAIL_MAX_ROWS_SCAN     default 50000, cap 200000
+  ENGAGEMENT_PARSE_CAMPAIGNS    default 200, cap 500
+  ENGAGEMENT_LISTS_FETCH_BATCH  default 300, floor 50, cap 2000  (lists batches)
+
+Also: CAMPAIGN_PERF_MAX, CAMPAIGN_PERF_DEFAULT, CAMPAIGN_ENGAGEMENT_SUMMARY_MAX,
+SUBSCRIBER_STATS_CHUNK_DAYS.
+
+================================================================================
+1. CORE MODULE: queries.py  (generic dashboard + /api/* except /api/sendy/*)
+================================================================================
+
+--- Subscribers — direct reads -------------------------------------------------
+Function: get_all_subscribers
+  Tables: subscribers
+  SQL:    Paginated SELECT id, email, name, list, flags, FROM_UNIXTIME(timestamp)
+  Route:  GET /api/data?resource=subscribers
+
+Function: get_subscribers_by_list
+  Tables: subscribers
+  SQL:    Same shape, WHERE list = :list_id
+  Route:  GET /api/data?resource=subscribers&list_id=…
+
+Function: get_active_subscriber_counts  [CACHE ttl=120]
+  Tables: subscribers
+  SQL:    GROUP BY list — filter (unsubscribed/bounced/complaint)
+  Route:  GET /api/data?resource=active_counts
+
+Function: get_subscriber_list_ids
+  Tables: subscribers
+  SQL:    SELECT id, list WHERE id IN (…)  — parameterized placeholders
+  Route:  Internal: build_engagement_for_subscribers (called in chunks of at most
+          min(USERS_EMAIL_IN_CHUNK, 500), with fallback 500 if env ≤ 0)
+  Notes:  [VAR] One query per chunk.
+
+Function: count_users  [CACHE ttl=120]
+  Tables: subscribers
+  SQL:    SELECT COUNT(*) … dynamic WHERE (timestamp via UNIX_TIMESTAMP, list,
+          confirmed-as-status, LOWER(email) LIKE)
+  Route:  GET /api/users/aggregate
+
+Function: count_users_distinct_email  [CACHE ttl=600]
+  Tables: subscribers
+  SQL:    SELECT COUNT(DISTINCT LOWER(TRIM(email))) …  [HOT] on huge tables
+  Route:  GET /api/users/aggregate
+
+Function: get_mailing_lists  [CACHE ttl=600]
+  Tables: lists
+  SQL:    SELECT id, name ORDER BY name
+  Route:  GET /api/lists
+
+Function: get_users  [CACHE ttl=30]
+  Tables: subscribers s, lists li
+  SQL:    JOIN + filters + ORDER BY timestamp DESC LIMIT/OFFSET
+  Route:  Not used by current app.py routes (utility / legacy).
+
+Function: get_users_by_email
+  Tables: subscribers s, lists li
+  SQL:    [VAR] Phase A: repeated SELECT … ORDER BY timestamp DESC, id DESC
+          LIMIT batch (USERS_EMAIL_FETCH_BATCH) until enough distinct emails
+          Phase B: chunked SELECT … email IN (…) or LOWER(TRIM(email)) IN (…)
+  Route:  GET /api/users
+  Notes:  Env: USERS_EMAIL_FETCH_BATCH, USERS_EMAIL_MAX_ROWS_SCAN, USERS_EMAIL_IN_CHUNK.
+
+--- Subscriber stats (growth chart) -------------------------------------------
+Function: get_subscriber_stats  [CACHE ttl=300]
+  Tables: subscribers
+  SQL:    Via _fetch_subscriber_stats_once: GROUP BY DATE_FORMAT(FROM_UNIXTIME(
+          timestamp), …) [+ list_id if filtered]
+  Route:  GET /api/stats?type=subscribers
+  Notes:  [VAR] Multiple queries if SUBSCRIBER_STATS_CHUNK_DAYS splits the range.
+
+--- Campaigns — reads ----------------------------------------------------------
+Function: get_all_campaigns
+  Tables: campaigns
+  SQL:    Paginated list (no opens/links parse)
+  Route:  GET /api/data?resource=campaigns
+
+Function: get_campaign_by_id
+  Tables: campaigns
+  SQL:    Single row by id
+  Route:  GET /api/data?resource=campaigns&campaign_id=…
+
+Function: get_campaign_stats  [CACHE ttl=300]
+  Tables: campaigns c, links lk (subquery aggregate)
+  SQL:    LEFT JOIN aggregated link clicks; opens/clicks via _comma_count on
+          c.opens and lk.clicks (native Sendy longtext).  [HOT]
+  Route:  GET /api/data?resource=campaign_stats
+
+Function: get_email_totals
+  Tables: campaigns
+  SQL:    COUNT(*), SUM(recipients) WHERE sent-in-date-range
+  Route:  GET /api/stats?type=campaigns (direct); passed into
+          get_campaign_engagement_summary as email_totals to avoid 2nd call.
+
+Function: get_campaigns_sent_in_range_list  [CACHE ttl=180]
+  Tables: campaigns c
+  SQL:    Light list in date range — placeholder zeros for opens/clicks columns
+  Route:  GET /api/stats?type=campaigns
+
+Function: get_campaign_performance
+  Tables: campaigns c, links lk
+  SQL:    (1) SELECT id … WHERE date filter ORDER BY send time LIMIT/OFFSET
+          (2) Per CAMPAIGN_PERF_DETAIL_CHUNK: detail SELECT with _comma_count on
+          c.opens, SUM(_comma_count(lk.clicks)) in subquery, id IN (…)
+  Route:  Internal: get_campaign_engagement_summary
+  Notes:  [VAR] 1 + ceil(n / chunk) round-trips.  [HOT] longtext per campaign row.
+
+Function: get_campaign_engagement_summary
+  Tables: campaigns, links (via get_campaign_performance); uses get_email_totals
+          only if email_totals argument is None
+  SQL:    Delegates to get_campaign_performance + get_email_totals (0–1×)
+  Route:  GET /api/stats?type=campaigns (try/except)
+  Notes:  app.py passes email_totals=totals → single get_email_totals per request.
+
+Function: get_campaign_metrics_by_id
+  Tables: campaigns c, links lk, subscribers s
+  SQL:    Single SELECT: _comma_count opens; link click sum; subscriber stats
+          WHERE last_campaign = :campaign_id
+  Route:  GET /api/campaigns/<id>/metrics
+  Notes:  [HOT] longtext opens for one campaign.
+
+--- Engagement map / per-subscriber engagement --------------------------------
+Function: get_engagement_map  [CACHE ttl=600]
+  Tables: campaigns, links
+  SQL:    SELECT COUNT(*) FROM campaigns WHERE …
+          [VAR] Batched: SELECT id, lists FROM campaigns WHERE … AND id < :cursor
+          ORDER BY id DESC LIMIT ENGAGEMENT_LISTS_FETCH_BATCH (loop until done)
+          SELECT id, lists?, opens … ORDER BY id DESC LIMIT N  (N = ENGAGEMENT_PARSE_CAMPAIGNS)
+          SELECT l.campaign_id, l.clicks FROM links l JOIN (campaign id subq) …
+  Route:  Internal: via get_engagement_map_cached → build_engagement_for_subscribers
+  Notes:  Python parses opens/clicks strings.  [HOT]
+
+Function: get_engagement_map_cached(*args, **kwargs)
+  Layer:  Flask request ``g`` dict — dedupes identical (date_from, date_to) within
+          one app request; falls back to direct get_engagement_map outside app ctx.
+  Route:  Used only from build_engagement_for_subscribers.
+
+Function: get_queue_delivered_counts
+  Tables: queue q, campaigns c
+  SQL:    [VAR] Same GROUP BY query repeated per chunk of subscriber IDs
+          (chunk size min(USERS_EMAIL_IN_CHUNK, 500)); results merged in Python.
+  Route:  Internal: build_engagement_for_subscribers
+  Notes:  Returns None if queue missing or error.
+
+Function: build_engagement_for_subscribers
+  Calls:  get_engagement_map_cached; get_subscriber_list_ids (chunked);
+          get_queue_delivered_counts (chunked)
+  Route:  GET /api/users?include_engagement=1, POST /api/engagement
+
+--- Misc ----------------------------------------------------------------------
+Function: run_query
+  SQL:    Arbitrary fetch_data wrapper (unused elsewhere in repo).
+
+================================================================================
+2. MODULE: sendy_queries.py  (/sendy UI + /api/sendy/*)
+================================================================================
+
+Function: get_overview_stats  [CACHE ttl=600]
+  Tables: campaigns c, links lk (aggregate), subscribers s
+  SQL:    (1) COUNT/SUM recipients + SUM(_comma_count(lk.clicks)) LEFT JOIN link agg
+          (2) Single pass: SUM(CASE bounced/unsubscribed) … FROM subscribers s
+          WHERE last_campaign IN (SELECT id FROM campaigns c WHERE …);
+          scalar (SELECT COUNT(*) FROM subscribers) AS total_subscribers
+  Route:  GET /api/sendy/stats
+  Notes:  [HOT] IN (SELECT campaign ids) when range is huge.
+
+Function: get_avg_open_rate  [CACHE ttl=3600]
+  Tables: campaigns
+  SQL:    SUM(_comma_count(c.opens)), SUM(recipients), weighted avg  [HOT]
+  Route:  GET /api/sendy/stats?type=open_rate
+
+Function: get_emails_over_time  [CACHE ttl=300]
+  Tables: campaigns c, links aggregate
+  SQL:    GROUP BY period; _comma_count on lk.clicks in link subquery
+  Route:  GET /api/sendy/stats
+
+Function: count_sent_campaigns  [CACHE ttl=120]
+  Tables: campaigns
+  SQL:    SELECT COUNT(*) with date filter
+  Route:  GET /api/sendy/campaigns
+
+Function: get_campaigns_stats  [CACHE ttl=600]
+  Tables: campaigns c, links aggregate, subscribers aggregate
+  SQL:    Per-campaign opens (_comma_count c.opens), clicks from links;
+          sub_agg: last_campaign IN (SELECT id FROM campaigns …)
+  Route:  GET /api/sendy/campaigns
+  Notes:  [HOT] longtext per row in page.
+
+Function: get_subscriber_totals  [CACHE ttl=120]
+  Tables: subscribers
+  SQL:    Single-row SUM/CASE aggregates
+  Route:  GET /api/sendy/stats, /api/sendy/subscribers
+
+Function: get_subscriber_growth  [CACHE ttl=120]
+  Tables: subscribers
+  SQL:    GROUP BY period on FROM_UNIXTIME(timestamp)
+  Route:  GET /api/sendy/subscribers
+
+Function: get_lists_summary  [CACHE ttl=120]
+  Tables: lists li, subscribers s
+  SQL:    LEFT JOIN + GROUP BY list
+  Route:  GET /api/sendy/subscribers
+
+================================================================================
+3. DATABASE LAYER: db.py
+================================================================================
+Engine init: SELECT 1
+fetch_data:  pandas read_sql(text(query), conn, params=…)
+Optional:    DB_READ_TIMEOUT / DB_WRITE_TIMEOUT / connect_timeout (PyMySQL) —
+             long remote queries can fail client-side before MySQL finishes.
+
+================================================================================
+4. NON-APPLICATION / DEV / TEST SQL
+================================================================================
+show_schema.py:   SHOW TABLES; COUNT(*); DESCRIBE; SHOW INDEX
+test_connection.py: SELECT VERSION(); COUNT(*); DESCRIBE
+test_engagement_flow.py: test SELECTs
+indexes.sql:      Recommended DDL / notes (not executed by Flask)
+
+================================================================================
+5. OPTIMIZATION THEMES (checklist)
+================================================================================
+• Longtext: campaigns.opens, links.clicks — _comma_count = LENGTH/REPLACE per row;
+  worst cost = many campaigns × get_campaign_performance / get_campaigns_stats /
+  get_engagement_map (limited N) / get_avg_open_rate.
+• Remote MySQL: minimize round-trips; batch result sets (engagement lists batches,
+  chunked IN lists); tune DB_READ_TIMEOUT if legitimate queries exceed default.
+• Subscriber scale: COUNT(DISTINCT LOWER(TRIM(email))), get_users_by_email scans,
+  chunked IN — tune env caps in §0.
+• Campaign filters: build_campaign_where_sent_in_range + effective send time;
+  secondary indexes on campaigns.sent / send_date help as table grows.
+• Caching: @cached TTLs (see headers); Redis (REDIS_URL) for shared cache across workers.
+• Dashboard load: GET /api/users and POST /api/engagement are separate HTTP requests —
+  Flask ``g`` cache does not dedupe across them; @cached still applies per key+ttl.
+
+================================================================================
+END OF INVENTORY
+================================================================================

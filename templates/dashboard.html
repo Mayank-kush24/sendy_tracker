@@ -218,12 +218,24 @@
       transition: transform 0.15s ease;
     }
     .campaign-item.is-open .campaign-chevron { transform: rotate(90deg); }
+    .campaign-item-head .cname-block {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      align-items: flex-start;
+    }
     .campaign-item-head .cname {
       color: var(--text);
       font-weight: 500;
-      flex: 1;
-      min-width: 0;
       word-break: break-word;
+    }
+    .campaign-item-head .cdate {
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-mid);
+      font-variant-numeric: tabular-nums;
     }
     .campaign-item-head .cid {
       color: var(--text-light);
@@ -231,8 +243,29 @@
       flex-shrink: 0;
       font-size: 11px;
     }
-    .campaign-item-detail { padding: 0 12px 10px 36px; }
+    .campaign-item-detail { padding: 0 12px 12px 36px; }
     .campaign-item-detail.hidden { display: none; }
+    .campaign-detail-body {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 16px 20px;
+      margin-top: 4px;
+    }
+    .campaign-detail-chart-wrap {
+      flex: 0 0 auto;
+      width: min(200px, 100%);
+      max-width: 220px;
+      aspect-ratio: 1;
+      position: relative;
+    }
+    .campaign-detail-chart-wrap canvas {
+      max-height: 220px;
+    }
+    .campaign-detail-body .campaign-metrics-grid {
+      flex: 1 1 160px;
+      min-width: 140px;
+    }
     .campaign-metrics-grid {
       display: grid;
       grid-template-columns: auto 1fr;
@@ -658,6 +691,8 @@ let lineChart = null;
 
 /** Cached JSON from ``/api/campaigns/<id>/metrics`` (collapse / re-expand avoids refetch). */
 const campaignMetricsCache = new Map();
+/** Chart.js instances for expanded campaign doughnuts (key = campaign id string). */
+const campaignDonutCharts = new Map();
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
@@ -1199,6 +1234,42 @@ function campaignFullName(d) {
   return d.campaign_id != null ? 'Campaign #' + d.campaign_id : '—';
 }
 
+/** Format Sendy ``send_date`` / ``campaign_sent`` for list + detail (locale-aware). */
+function formatCampaignSentOn(d) {
+  if (!d) return '—';
+  const tryUnixSeconds = raw => {
+    const s = String(raw).trim();
+    if (!/^\d{9,11}$/.test(s)) return null;
+    const sec = Number(s);
+    const ms = sec < 1e12 ? sec * 1000 : sec;
+    const dt = new Date(ms);
+    return Number.isFinite(dt.getTime()) ? dt : null;
+  };
+
+  const sd = d.send_date != null ? String(d.send_date).trim() : '';
+  if (sd) {
+    const u = tryUnixSeconds(sd);
+    if (u) {
+      return u.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    }
+    const m = sd.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) {
+      const dt = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      if (Number.isFinite(dt.getTime())) {
+        return dt.toLocaleDateString(undefined, { dateStyle: 'medium' });
+      }
+    }
+    return sd.length > 48 ? sd.slice(0, 48) + '…' : sd;
+  }
+
+  const cs = d.campaign_sent != null ? String(d.campaign_sent).trim() : '';
+  if (!cs || cs === '0') return '—';
+  const u2 = tryUnixSeconds(cs);
+  if (u2) return u2.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  if (cs === '1') return '—';
+  return cs.length > 24 ? cs.slice(0, 24) + '…' : cs;
+}
+
 function fmtMetricInt(n) {
   if (n == null || n === '') return '—';
   const x = Number(n);
@@ -1211,8 +1282,82 @@ function fmtMetricPct(n) {
   return Number.isFinite(x) ? x.toFixed(1) + '%' : '—';
 }
 
-function renderCampaignMetricsInner(container, d) {
+function destroyCampaignDonut(campaignIdStr) {
+  const ch = campaignDonutCharts.get(campaignIdStr);
+  if (ch) {
+    ch.destroy();
+    campaignDonutCharts.delete(campaignIdStr);
+  }
+}
+
+function renderCampaignEngagementDonut(canvasId, d, campaignIdStr) {
+  const el = document.getElementById(canvasId);
+  if (!el || typeof Chart === 'undefined') return;
+
+  const sent = Math.max(0, Number(d.sent) || 0);
+  const opened = Math.max(0, Number(d.opens) || 0);
+  const clicked = Math.max(0, Number(d.clicks) || 0);
+  const bounced =
+    Math.max(0, Number(d.bounces) || 0) + Math.max(0, Number(d.soft_bounces) || 0);
+
+  const labels = ['Sent', 'Opened', 'Clicked', 'Bounced'];
+  const data = [sent, opened, clicked, bounced];
+  const sum = data.reduce((a, b) => a + b, 0);
+  if (sum <= 0) {
+    const p = document.createElement('p');
+    p.className = 'campaign-metrics-loading';
+    p.textContent = 'No data for chart.';
+    el.parentNode?.replaceChild(p, el);
+    return;
+  }
+
+  const chart = new Chart(el, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [
+        {
+          data,
+          backgroundColor: ['#64748b', '#10b981', '#6366f1', '#f87171'],
+          borderWidth: 2,
+          borderColor: '#fff',
+          hoverOffset: 4,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      aspectRatio: 1,
+      cutout: '58%',
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: { boxWidth: 8, font: { size: 10 }, padding: 6 },
+        },
+        tooltip: {
+          callbacks: {
+            label(ctx) {
+              const n = Number(ctx.raw) || 0;
+              const t = n.toLocaleString();
+              if (ctx.dataIndex === 0 || !sent) return ` ${ctx.label}: ${t}`;
+              const pct = Math.round((n * 1000) / sent) / 10;
+              return ` ${ctx.label}: ${t} (${pct}% of sent)`;
+            },
+          },
+        },
+      },
+    },
+  });
+  campaignDonutCharts.set(campaignIdStr, chart);
+}
+
+function renderCampaignMetricsInner(container, d, campaignIdStr) {
+  destroyCampaignDonut(campaignIdStr);
+
+  const sentOn = formatCampaignSentOn(d);
   const pairs = [
+    ['Sent on', sentOn === '—' ? '—' : esc(sentOn)],
     ['Sent', fmtMetricInt(d.sent)],
     ['Opens', fmtMetricInt(d.opens)],
     ['Open rate', fmtMetricPct(d.open_rate_pct)],
@@ -1225,15 +1370,26 @@ function renderCampaignMetricsInner(container, d) {
     ['Unsub rate', fmtMetricPct(d.unsub_rate_pct)],
     ['Complaints', fmtMetricInt(d.complaints)],
   ];
+  const safeDonutId = String(campaignIdStr).replace(/[^a-zA-Z0-9_-]/g, '');
+  const canvasId = 'camp-donut-' + safeDonutId;
   container.innerHTML =
+    '<div class="campaign-detail-body">' +
+    `<div class="campaign-detail-chart-wrap"><canvas id="${canvasId}" aria-label="Sent, opened, clicked, bounced counts"></canvas></div>` +
     '<dl class="campaign-metrics-grid">' +
     pairs.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('') +
-    '</dl>';
+    '</dl></div>';
+
+  requestAnimationFrame(() => {
+    if (!document.getElementById(canvasId)) return;
+    renderCampaignEngagementDonut(canvasId, d, campaignIdStr);
+  });
 }
 
 function collapseOtherCampaignItems(ul, exceptLi) {
   ul.querySelectorAll('.campaign-item.is-open').forEach(li => {
     if (li === exceptLi) return;
+    const oid = li.dataset.campaignId;
+    if (oid) destroyCampaignDonut(oid);
     li.classList.remove('is-open');
     const h = li.querySelector('.campaign-item-head');
     const det = li.querySelector('.campaign-item-detail');
@@ -1256,6 +1412,7 @@ function onCampaignListClick(e) {
 
   const wasOpen = li.classList.contains('is-open');
   if (wasOpen) {
+    destroyCampaignDonut(idRaw);
     li.classList.remove('is-open');
     head.setAttribute('aria-expanded', 'false');
     const det = li.querySelector('.campaign-item-detail');
@@ -1277,14 +1434,14 @@ function onCampaignListClick(e) {
   inner.innerHTML = '<p class="campaign-metrics-loading">Loading stats…</p>';
 
   if (campaignMetricsCache.has(idRaw)) {
-    renderCampaignMetricsInner(inner, campaignMetricsCache.get(idRaw));
+    renderCampaignMetricsInner(inner, campaignMetricsCache.get(idRaw), idRaw);
     return;
   }
 
   apiFetch('/api/campaigns/' + encodeURIComponent(idRaw) + '/metrics')
     .then(data => {
       campaignMetricsCache.set(idRaw, data);
-      if (li.classList.contains('is-open')) renderCampaignMetricsInner(inner, data);
+      if (li.classList.contains('is-open')) renderCampaignMetricsInner(inner, data, idRaw);
     })
     .catch(err => {
       if (li.classList.contains('is-open')) {
@@ -1341,12 +1498,19 @@ function renderCampaignList(rows, campRes) {
         d.campaign_id != null
           ? '#' + d.campaign_id + (d.emails_sent != null ? ' · ' + Number(d.emails_sent).toLocaleString() + ' sent' : '')
           : '';
+      const dateStr = formatCampaignSentOn(d);
+      const dateLine =
+        dateStr && dateStr !== '—'
+          ? `<span class="cdate" title="Sent on">Sent ${esc(dateStr)}</span>`
+          : '';
       const label = cid ? 'Show stats for campaign ' + cid : 'Campaign row';
       return (
         `<li class="campaign-item" data-campaign-id="${esc(cid)}">` +
         `<div class="campaign-item-head" role="button" tabindex="0" aria-expanded="false" aria-label="${esc(label)}">` +
         `<span class="campaign-chevron" aria-hidden="true">▸</span>` +
-        `<span class="cname">${esc(name)}</span>` +
+        `<span class="cname-block">` +
+        `<span class="cname">${esc(name)}</span>${dateLine}` +
+        `</span>` +
         `<span class="cid">${esc(idPart)}</span>` +
         `</div>` +
         `<div class="campaign-item-detail hidden" aria-hidden="true">` +

@@ -45,32 +45,13 @@ from cache import cached
 from db import fetch_data
 from queries import (
     _CAMPAIGN_DISPLAY_SQL,
+    _comma_count,
     build_campaign_where_sent_in_range,
     campaign_effective_unix_ts_sql,
 )
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# SQL building-block helpers
-# ---------------------------------------------------------------------------
-
-def _comma_count(col: str) -> str:
-    """
-    SQL expression: count comma-separated entries in *col*.
-
-    Sendy stores opens as 'sub_id:country,sub_id:country,...' and clicks as
-    'sub_id,sub_id,...' — both are comma-delimited, NOT PHP serialized.
-
-    Formula: (string length) − (length with commas removed) + 1
-    Returns 0 for NULL / empty string.
-    """
-    return (
-        f"CASE WHEN {col} IS NULL OR {col} = '' THEN 0 "
-        f"ELSE LENGTH({col}) - LENGTH(REPLACE({col}, ',', '')) + 1 END"
-    )
-
-# Keep old name as alias so any leftover references don't break
 _php_count = _comma_count
 
 
@@ -116,7 +97,7 @@ def _period_expr(fmt: str) -> str:
 # Campaign stats
 # ---------------------------------------------------------------------------
 
-@cached(ttl=300)
+@cached(ttl=600)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def get_overview_stats(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -143,12 +124,11 @@ def get_overview_stats(
     cw, bind = _campaign_where(date_from, date_to, bind)
     where_sql    = "WHERE " + cw
 
-    clicks_expr = _comma_count("lk.clicks")
-
     # ── Query 1 (~0.4 s): campaign count, total sent, total clicks ────────
     # Clicks use a pre-aggregated JOIN on links (10 K rows — always fast).
     # Opens are NOT computed here because LENGTH(REPLACE(opens,...)) on 300+
     # longtext rows can take 15–60 s and time out on shared hosting.
+    clicks_expr = _comma_count("lk.clicks")
     sql_main = f"""
         SELECT
             COUNT(c.id)                       AS total_campaigns,
@@ -165,22 +145,20 @@ def get_overview_stats(
     """
     df_main = fetch_data(sql_main, bind)
 
-    # ── Query 2 (~7 s): subscriber stats filtered to campaigns in range ───
-    # Running 3 subqueries in a single round-trip is faster than 3 separate
-    # network calls.  COUNT(*) is faster than SUM() for these filters.
+    # ── Query 2: bounces / unsubs tied to campaigns in range ───────────────────────
+    # OPTIMIZED: replaced 3 correlated subqueries with single conditional aggregation
+    # (one subscribers scan + campaigns id subquery).  Global subscriber count comes
+    # from cached ``get_subscriber_totals()`` — avoids COUNT(*) full scan inside this query.
     sql_subs = f"""
         SELECT
-            (SELECT COUNT(*) FROM subscribers
-             WHERE  bounced = 1
-               AND  last_campaign IN (SELECT c.id FROM campaigns c {where_sql})
-            ) AS total_bounces,
-            (SELECT COUNT(*) FROM subscribers
-             WHERE  unsubscribed = 1
-               AND  last_campaign IN (SELECT c.id FROM campaigns c {where_sql})
-            ) AS total_unsubscribes,
-            (SELECT COUNT(*) FROM subscribers) AS total_subscribers
+            COALESCE(SUM(CASE WHEN s.bounced = 1 THEN 1 ELSE 0 END), 0)       AS total_bounces,
+            COALESCE(SUM(CASE WHEN s.unsubscribed = 1 THEN 1 ELSE 0 END), 0) AS total_unsubscribes
+        FROM subscribers s
+        WHERE s.last_campaign IN (SELECT c.id FROM campaigns c {where_sql})
     """
     df_subs = fetch_data(sql_subs, bind)
+    df_totals = get_subscriber_totals()
+    total_subscribers = int(df_totals.iloc[0]["total"] or 0) if len(df_totals) else 0
 
     # ── Merge ─────────────────────────────────────────────────────────────
     total_sent    = int(df_main.iloc[0]["total_sent"]    or 0) if len(df_main) else 0
@@ -193,7 +171,7 @@ def get_overview_stats(
         "total_clicks":       total_clicks,
         "total_bounces":      total_bounces,
         "total_unsubscribes": int(df_subs.iloc[0]["total_unsubscribes"] or 0) if len(df_subs) else 0,
-        "total_subscribers":  int(df_subs.iloc[0]["total_subscribers"]  or 0) if len(df_subs) else 0,
+        "total_subscribers":  total_subscribers,
         # avg_open_rate computed separately via /api/sendy/stats?type=open_rate
         # to avoid timing out on the opens longtext column
         "avg_open_rate_pct":  None,
@@ -203,7 +181,7 @@ def get_overview_stats(
     return pd.DataFrame([merged])
 
 
-@cached(ttl=3600)   # 1 hour — this query takes 15–20 s so cache aggressively
+@cached(ttl=3600)   # 1 hour — expensive longtext scan; keep cache
 def get_avg_open_rate(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -211,9 +189,8 @@ def get_avg_open_rate(
     """
     Compute the weighted average open rate across all sent campaigns in the range.
 
-    This is SLOW (15–20 s) because it runs LENGTH(REPLACE(opens,...)) on
-    potentially hundreds of longtext fields.  It is cached for 1 hour and
-    loaded asynchronously by the frontend so it does not block the initial page.
+    Uses ``_comma_count(c.opens)`` on Sendy's ``campaigns.opens`` longtext.
+    Cached for 1 hour and loaded asynchronously by the frontend.
     """
     import datetime as _dt
     if date_from is None:
@@ -224,8 +201,8 @@ def get_avg_open_rate(
     bind = {}
     cw, bind = _campaign_where(date_from, date_to, bind)
     where_sql    = "WHERE " + cw
-    opens_expr   = _comma_count("c.opens")
 
+    opens_expr = _comma_count("c.opens")
     sql = f"""
         SELECT
             COALESCE(SUM({opens_expr}), 0)              AS total_opens,
@@ -263,12 +240,12 @@ def get_emails_over_time(
     """
     fmt        = _PERIOD_FMT.get(group_by, "%Y-%m")
     period_col = _period_expr(fmt)
-    clicks_expr = _comma_count("lk.clicks")
 
     bind = {}
     cw, bind = _campaign_where(date_from, date_to, bind)
     where_sql    = "WHERE " + cw
 
+    clicks_expr = _comma_count("lk.clicks")
     sql = f"""
         SELECT
             {period_col}                                AS period,
@@ -306,7 +283,7 @@ def count_sent_campaigns(
     return int(df.iloc[0]["total"]) if len(df) else 0
 
 
-@cached(ttl=300)
+@cached(ttl=600)  # OPTIMIZED: increased TTL to reduce HOT query frequency
 def get_campaigns_stats(
     date_from: str | None = None,
     date_to: str | None = None,
@@ -316,24 +293,25 @@ def get_campaigns_stats(
     """
     Per-campaign breakdown, newest first.
 
-    Opens come from parsing the PHP-serialized ``campaigns.opens`` longtext.
-    Clicks are summed from ``links.clicks`` per campaign (correlated subquery,
-    efficient because LIMIT keeps the outer result small).
+    Opens/clicks use ``_comma_count`` on ``campaigns.opens`` and ``links.clicks``.
+    Clicks are pre-aggregated from ``links`` per campaign (JOIN subquery).
     Bounces / unsubscribes are attributed via ``subscribers.last_campaign``.
     """
     bind = {}
     cw, bind = _campaign_where(date_from, date_to, bind)
     where_sql = "WHERE " + cw
+    clause_c2, bind = build_campaign_where_sent_in_range("c2", date_from, date_to, bind)
     bind["_limit"]  = limit
     bind["_offset"] = offset
 
-    opens_expr  = _comma_count("c.opens")
-    clicks_expr = _comma_count("lk.clicks")   # alias must match FROM links lk
     period_col  = _period_expr("%Y-%m-%d")
 
     # Pre-aggregate clicks (links: 10K rows) and subscriber stats (11.9M rows,
-    # indexed on last_campaign) into derived tables — avoids N correlated
-    # subqueries per campaign row which would take 8+ seconds for 200 rows.
+    # indexed on last_campaign) into derived tables.  Subscriber slice uses
+    # ``INNER JOIN campaigns c2`` with the same sent-in-range predicate as ``c``
+    # (shared :date_from / :date_to) instead of ``IN (SELECT …)`` per row.
+    opens_expr = _comma_count("c.opens")
+    clicks_expr = _comma_count("lk.clicks")
     sql = f"""
         SELECT
             c.id                                                            AS campaign_id,
@@ -366,9 +344,9 @@ def get_campaigns_stats(
                    SUM(s.bounced)      AS bounces,
                    SUM(s.unsubscribed) AS unsubs
             FROM   subscribers s
-            WHERE  s.last_campaign IN (
-                SELECT c.id FROM campaigns c {where_sql}
-            )
+            INNER JOIN campaigns c2
+                   ON c2.id = s.last_campaign
+                  AND {clause_c2}
             GROUP  BY s.last_campaign
         ) sub_agg ON sub_agg.last_campaign = c.id
         {where_sql}
@@ -382,7 +360,7 @@ def get_campaigns_stats(
 # Subscriber stats
 # ---------------------------------------------------------------------------
 
-@cached(ttl=120)
+@cached(ttl=300)
 def get_subscriber_totals() -> pd.DataFrame:
     """
     Single-row aggregate across all subscribers.
@@ -449,7 +427,7 @@ def get_subscriber_growth(
     return fetch_data(sql, bind)
 
 
-@cached(ttl=120)
+@cached(ttl=300)
 def get_lists_summary() -> pd.DataFrame:
     """
     Per-list subscriber health.

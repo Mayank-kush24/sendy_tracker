@@ -848,10 +848,12 @@ def _register_routes(app: Flask) -> None:
 
             engagement_summary = None
             try:
+                # OPTIMIZED: avoid duplicate get_email_totals call per request
                 raw_es = queries.get_campaign_engagement_summary(
                     date_from=date_from,
                     date_to=date_to,
                     status=status,
+                    email_totals=totals,
                 )
                 cir = int(raw_es.get("campaigns_in_range") or 0)
                 if cir > 0:
